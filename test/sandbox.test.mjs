@@ -54,7 +54,7 @@ describe('sandbox arguments', () => {
         assert.ok(readOnly.includes('/srv/ca.pem'), 'CA files named in the environment are mounted');
         assert.ok(!readOnly.includes('relative.pem'));
         for (const source of readOnly) {
-            const resolverDir = /^\/run\/(systemd\/resolve|NetworkManager|resolvconf|connman)/.test(source);
+            const resolverDir = source === '/run/systemd/resolve' || source === '/run/resolvconf';
             assert.ok(!source.startsWith('/home') && (!source.startsWith('/run') || resolverDir) && !source.startsWith('/root') && source !== '/' && source !== '/etc', source);
             assert.ok(!source.startsWith(os.homedir()), source);
         }
@@ -64,11 +64,12 @@ describe('sandbox arguments', () => {
 });
 
 /** A minimal classic-BPF interpreter for the instructions seccompProgram emits. */
-function runFilter(program, { nr, arch, arg0 = 0 }) {
+function runFilter(program, { nr, arch, arg0 = 0, arg1 = 0 }) {
     const data = Buffer.alloc(64);
     data.writeUInt32LE(nr >>> 0, 0);
     data.writeUInt32LE(arch >>> 0, 4);
     data.writeUInt32LE(arg0 >>> 0, 16);
+    data.writeUInt32LE(arg1 >>> 0, 24);
     let acc = 0;
     for (let pc = 0; pc < program.length / 8;) {
         const code = program.readUInt16LE(pc * 8);
@@ -77,6 +78,7 @@ function runFilter(program, { nr, arch, arg0 = 0 }) {
         const k = program.readUInt32LE(pc * 8 + 4);
         pc += 1;
         if (code === 0x20) acc = data.readUInt32LE(k);
+        else if (code === 0x54) acc = (acc & k) >>> 0;
         else if (code === 0x15) pc += acc === k ? jt : jf;
         else if (code === 0x35) pc += acc >= k ? jt : jf;
         else if (code === 0x06) return k;
@@ -88,13 +90,26 @@ function runFilter(program, { nr, arch, arg0 = 0 }) {
 describe('seccomp filter', () => {
     const ALLOW = 0x7fff0000;
     const errno = (value) => 0x00050000 | value;
-    for (const [arch, audit, socketNr, otherNr] of [['x64', 0xc000003e, 41, 42], ['arm64', 0xc00000b7, 198, 203]]) {
-        it(`refuses Unix sockets and foreign ABIs on ${arch}`, () => {
+    for (const [arch, audit, socketNr, pairNr, otherNr] of [['x64', 0xc000003e, 41, 53, 42], ['arm64', 0xc00000b7, 198, 199, 203]]) {
+        it(`allows only the socket families the backend needs on ${arch}`, () => {
             const program = seccompProgram(arch);
-            assert.equal(runFilter(program, { arch: audit, nr: socketNr, arg0: 1 }), errno(97), 'socket(AF_UNIX)');
-            assert.equal(runFilter(program, { arch: audit, nr: socketNr, arg0: 2 }), ALLOW, 'socket(AF_INET)');
-            assert.equal(runFilter(program, { arch: audit, nr: socketNr, arg0: 10 }), ALLOW, 'socket(AF_INET6)');
+            for (const [family, name] of [[1, 'AF_UNIX'], [40, 'AF_VSOCK'], [17, 'AF_PACKET'], [0, 'AF_UNSPEC']]) {
+                assert.equal(runFilter(program, { arch: audit, nr: socketNr, arg0: family }), errno(97), `socket(${name})`);
+            }
+            for (const [family, name] of [[2, 'AF_INET'], [10, 'AF_INET6'], [16, 'AF_NETLINK']]) {
+                assert.equal(runFilter(program, { arch: audit, nr: socketNr, arg0: family }), ALLOW, `socket(${name})`);
+            }
             assert.equal(runFilter(program, { arch: audit, nr: otherNr, arg0: 1 }), ALLOW, 'other calls with a first argument of 1');
+        });
+
+        it(`refuses datagram socketpairs, io_uring and foreign ABIs on ${arch}`, () => {
+            const program = seccompProgram(arch);
+            const SOCK_CLOEXEC = 0x80000;
+            assert.equal(runFilter(program, { arch: audit, nr: pairNr, arg0: 1, arg1: 2 }), errno(97), 'socketpair(SOCK_DGRAM)');
+            assert.equal(runFilter(program, { arch: audit, nr: pairNr, arg0: 1, arg1: 2 | SOCK_CLOEXEC }), errno(97), 'socketpair(SOCK_DGRAM | SOCK_CLOEXEC)');
+            assert.equal(runFilter(program, { arch: audit, nr: pairNr, arg0: 1, arg1: 1 | SOCK_CLOEXEC }), ALLOW, 'socketpair(SOCK_STREAM)');
+            for (const nr of [425, 426, 427]) assert.equal(runFilter(program, { arch: audit, nr }), errno(38), `io_uring syscall ${nr}`);
+            for (const nr of [424, 428]) assert.equal(runFilter(program, { arch: audit, nr }), ALLOW, `syscall ${nr}`);
             assert.equal(runFilter(program, { arch: 0x40000003, nr: 102, arg0: 1 }), errno(38), 'i386 entry point (socketcall)');
         });
     }
@@ -187,6 +202,17 @@ describe('sandbox containment (real bubblewrap)', { skip: skipReal }, () => {
     });
 
     it('serves, restarts after a crash and stops cleanly as the managed backend', { timeout: 120000 }, async () => {
+        // Only this test's backends: other gateways on the machine may be running sandboxed too.
+        const existing = new Set(fs.readdirSync(os.tmpdir()));
+        const descendants = (pid) => {
+            let kids = [];
+            try {
+                kids = fs.readdirSync(`/proc/${pid}/task`).flatMap((task) => fs.readFileSync(`/proc/${pid}/task/${task}/children`, 'utf8').split(' ').filter(Boolean).map(Number));
+            } catch {
+                return [];
+            }
+            return kids.flatMap((kid) => [kid, ...descendants(kid)]);
+        };
         for (const profile of ['compatible', 'chat']) {
             const backend = createManagedBackend({ opencodePath: '', profile, sandbox: 'bwrap', logger: silentLogger });
             let pids = [];
@@ -195,13 +221,20 @@ describe('sandbox containment (real bubblewrap)', { skip: skipReal }, () => {
                 assert.equal(backend.sandbox(), 'bwrap', profile);
                 assert.equal((await backend.getClient().health()).healthy, true, profile);
                 const backendPid = () => fs.readdirSync(os.tmpdir())
-                    .filter((name) => name.startsWith('zengate-'))
+                    .filter((name) => name.startsWith('zengate-') && !existing.has(name))
                     .map((name) => path.join(os.tmpdir(), name, 'backend.pid'))
                     .filter((file) => fs.existsSync(file))
                     .map((file) => Number(fs.readFileSync(file, 'utf8')))
                     .filter((pid) => { try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('/zengate-bin/'); } catch { return false; } });
                 pids = backendPid();
-                assert.equal(pids.length >= 1, true, 'the sandboxed backend is running');
+                assert.equal(pids.length, 1, 'the sandboxed backend is running');
+                const opencode = descendants(pids[0]).filter((pid) => {
+                    try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').startsWith('/zengate-bin/'); } catch { return false; }
+                });
+                assert.ok(opencode.length >= 1, `${profile}: OpenCode runs inside bubblewrap`);
+                for (const pid of opencode) {
+                    assert.match(fs.readFileSync(`/proc/${pid}/status`, 'utf8'), /^Seccomp:\s+2$/m, `${profile}: the seccomp filter applies to OpenCode`);
+                }
                 const first = backend.getClient().baseUrl;
                 for (const pid of pids) process.kill(pid, 'SIGKILL');
                 const deadline = Date.now() + 30000;
@@ -224,6 +257,12 @@ describe('sandbox containment (real bubblewrap)', { skip: skipReal }, () => {
         try {
             await backend.start();
             const first = backend.getClient().baseUrl;
+            // Let fs.watchFile take its first stat, which it does asynchronously after starting.
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            fs.writeFileSync(`${file}.new`, 'nameserver 192.0.2.1\n');
+            fs.renameSync(`${file}.new`, file);
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            assert.equal(backend.getClient().baseUrl, first, 'the same content does not restart the backend');
             fs.writeFileSync(`${file}.new`, 'nameserver 192.0.2.2\n');
             fs.renameSync(`${file}.new`, file);
             const deadline = Date.now() + 30000;

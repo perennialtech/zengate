@@ -125,20 +125,35 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
     /** undefined until decided on the first launch, then the sandbox to use or null. */
     let sandbox;
     let watchingResolv = false;
+    /** The resolv.conf content the running backend started with. */
+    let resolvSeen = null;
+
+    const readResolv = () => {
+        try {
+            return fs.readFileSync(resolvWatch.file, 'utf8');
+        } catch {
+            return null;
+        }
+    };
 
     /**
-     * A sandbox holding a plain-file resolv.conf keeps the copy it started
-     * with. When the host's changes (a new network or VPN), restart the
-     * backend so it resolves names with the new servers.
+     * A sandbox holding a pinned resolv.conf keeps the copy it started with.
+     * When the host's content changes (a new network or VPN), restart the
+     * backend so it resolves names with the new servers. Only a serving
+     * backend is restarted: one that is starting reads the file afresh.
      */
-    function onResolvChange(current, previous) {
-        if (stopping || !child || (current.ino === previous.ino && current.mtimeMs === previous.mtimeMs)) return;
+    function onResolvChange() {
+        if (stopping || !ready || !child) return;
+        const content = readResolv();
+        if (content === null || content === resolvSeen) return;
         logger.info(`${resolvWatch.file} changed; restarting the sandboxed OpenCode backend so it uses the new DNS settings`);
         killTree(child);
     }
 
     function watchResolv() {
-        if (watchingResolv || !sandbox || !resolvConfPinned(resolvWatch.file)) return;
+        if (!sandbox || !resolvConfPinned(resolvWatch.file)) return;
+        resolvSeen = readResolv();
+        if (watchingResolv) return;
         watchingResolv = true;
         fs.watchFile(resolvWatch.file, { interval: resolvWatch.intervalMs, persistent: false }, onResolvChange);
     }

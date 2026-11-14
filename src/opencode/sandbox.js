@@ -14,8 +14,9 @@ import path from 'node:path';
  * a random host directory, and the hostname is fixed too.
  *
  * Sharing the network namespace also shares the host's abstract Unix
- * sockets (X11 displays, some D-Bus buses), so a seccomp filter refuses to
- * create Unix-domain sockets inside. Loopback TCP services stay reachable.
+ * sockets (X11 displays, some D-Bus buses), so a seccomp filter
+ * (seccompProgram) keeps Unix-domain sockets that could reach them from
+ * being created inside. Loopback TCP services stay reachable.
  */
 export const SANDBOX_MODES = Object.freeze(['auto', 'bwrap', 'off']);
 
@@ -50,38 +51,37 @@ export function innerDirs(dirs) {
 export const innerBinary = (binary) => path.posix.join(INNER_BIN, path.basename(binary));
 
 /**
- * resolv.conf as a live view. A bind mount of a single file pins its inode,
- * and resolvers (NetworkManager, systemd-resolved) replace the file on every
- * network change, so a symlink into /run is recreated with its target's
- * directory mounted instead. A plain file is still bound as a file;
- * `resolvConfPinned()` says when that happens so the caller can restart the
- * backend after a change.
+ * Resolver directories under /run that hold only resolv.conf variants, so
+ * mounting one exposes nothing else. A bind mount of a single file pins its
+ * inode, and resolvers replace the file on every network change, so a
+ * resolv.conf that resolves into one of these is recreated as a symlink to
+ * its real target with that directory mounted. Anything else (a plain file,
+ * NetworkManager's /run/NetworkManager, which also holds device state and
+ * connection names) is bound as a file; `resolvConfPinned()` says so, and the
+ * caller restarts the backend when the file changes.
  */
+const LIVE_RESOLVER_DIRS = ['/run/systemd/resolve', '/run/resolvconf'];
+
+/** The real resolv.conf when it lives in a resolver directory that can be mounted whole, or null. */
+function liveResolvTarget(file = RESOLV_CONF) {
+    try {
+        if (!fs.lstatSync(file).isSymbolicLink()) return null;
+        const target = fs.realpathSync(file);
+        return LIVE_RESOLVER_DIRS.includes(path.dirname(target)) ? target : null;
+    } catch {
+        return null;
+    }
+}
+
 function resolvMounts() {
-    let stat;
-    try {
-        stat = fs.lstatSync(RESOLV_CONF);
-    } catch {
-        return [];
-    }
-    if (!stat.isSymbolicLink()) return ['--ro-bind-try', RESOLV_CONF, RESOLV_CONF];
-    let target;
-    try {
-        target = fs.realpathSync(RESOLV_CONF);
-    } catch {
-        return [];
-    }
-    if (!target.startsWith('/run/')) return ['--ro-bind-try', RESOLV_CONF, RESOLV_CONF];
-    return ['--ro-bind', path.dirname(target), path.dirname(target), '--symlink', fs.readlinkSync(RESOLV_CONF), RESOLV_CONF];
+    const target = liveResolvTarget();
+    if (!target) return ['--ro-bind-try', RESOLV_CONF, RESOLV_CONF];
+    return ['--ro-bind', path.dirname(target), path.dirname(target), '--symlink', target, RESOLV_CONF];
 }
 
 /** Whether the sandbox sees a copy of resolv.conf that will not follow host changes. */
 export function resolvConfPinned(file = RESOLV_CONF) {
-    try {
-        return !fs.lstatSync(file).isSymbolicLink() || !fs.realpathSync(file).startsWith('/run/');
-    } catch {
-        return false;
-    }
+    return fs.existsSync(file) && !liveResolvTarget(file);
 }
 
 function systemMounts() {
@@ -111,6 +111,7 @@ function caMounts(env) {
 
 // Classic BPF for seccomp (struct sock_filter: u16 code, u8 jt, u8 jf, u32 k).
 const LD_W_ABS = 0x20;
+const AND_K = 0x54;
 const JEQ_K = 0x15;
 const JGE_K = 0x35;
 const RET_K = 0x06;
@@ -118,46 +119,94 @@ const RET_ALLOW = 0x7fff0000;
 const RET_ERRNO = 0x00050000;
 const ENOSYS = 38;
 const EAFNOSUPPORT = 97;
-const AF_UNIX = 1;
+/** The socket families the backend needs: IPv4, IPv6, and netlink (interface lookups). */
+const ALLOWED_FAMILIES = [2, 10, 16];
+const SOCK_TYPE_MASK = 0xf;
+const SOCK_DGRAM = 2;
+/** io_uring_setup, io_uring_enter, io_uring_register (the same on x86_64 and arm64). */
+const IO_URING_FIRST = 425;
+const IO_URING_END = 428;
 const X32_SYSCALL_BIT = 0x40000000;
-/** seccomp_data offsets: nr, arch, then args[0] (its low 32 bits on little-endian hosts). */
+/** seccomp_data offsets: nr, arch, then the low 32 bits of args[0] and args[1] (little-endian hosts). */
 const DATA_NR = 0;
 const DATA_ARCH = 4;
 const DATA_ARG0 = 16;
+const DATA_ARG1 = 24;
 const ARCHES = Object.freeze({
-    x64: { audit: 0xc000003e, socket: 41, x32: true },
-    arm64: { audit: 0xc00000b7, socket: 198, x32: false },
+    x64: { audit: 0xc000003e, socket: 41, socketpair: 53, x32: true },
+    arm64: { audit: 0xc00000b7, socket: 198, socketpair: 199, x32: false },
 });
 
 /**
+ * Assemble instructions whose jump targets are labels. Each entry is
+ * [code, k], [code, k, jt, jf] with label names, or a string marking a label.
+ */
+function assemble(source) {
+    const labels = new Map();
+    const ops = [];
+    for (const item of source) {
+        if (typeof item === 'string') labels.set(item, ops.length);
+        else ops.push(item);
+    }
+    const program = Buffer.alloc(ops.length * 8);
+    ops.forEach(([code, k, jt, jf], index) => {
+        const offset = (label) => {
+            if (label === undefined) return 0;
+            const target = labels.get(label);
+            if (target === undefined || target <= index || target - index - 1 > 255) throw new Error(`bad BPF jump to ${label}`);
+            return target - index - 1;
+        };
+        program.writeUInt16LE(code, index * 8);
+        program.writeUInt8(offset(jt), index * 8 + 2);
+        program.writeUInt8(offset(jf), index * 8 + 3);
+        program.writeUInt32LE(k >>> 0, index * 8 + 4);
+    });
+    return program;
+}
+
+/**
  * The seccomp program for `arch` (a process.arch value), or null where none
- * is defined. It refuses socket(AF_UNIX, ...) with EAFNOSUPPORT, and every
- * system call made through another ABI (32-bit or x32 entry points, which
- * would bypass a filter written for native numbers) with ENOSYS.
+ * is defined. With the network namespace shared, it is what keeps the host's
+ * abstract Unix sockets out of reach:
+ * - socket() only for IPv4, IPv6 and netlink (EAFNOSUPPORT otherwise);
+ * - no datagram socketpair(), which could sendto() an abstract address
+ *   (stream pairs, which Bun uses for subprocesses, cannot be re-addressed);
+ * - no io_uring, whose IORING_OP_SOCKET creates sockets without socket();
+ * - nothing through another ABI (32-bit or x32 entry points use other
+ *   numbers and would slip past the checks above) - all ENOSYS.
  */
 export function seccompProgram(arch = process.arch) {
     const spec = ARCHES[arch];
     if (!spec) return null;
-    const ops = [
-        [LD_W_ABS, 0, 0, DATA_ARCH],
-        [JEQ_K, 1, 0, spec.audit],
-        [RET_K, 0, 0, RET_ERRNO | ENOSYS],
-        [LD_W_ABS, 0, 0, DATA_NR],
-        ...(spec.x32 ? [[JGE_K, 0, 1, X32_SYSCALL_BIT], [RET_K, 0, 0, RET_ERRNO | ENOSYS]] : []),
-        [JEQ_K, 0, 3, spec.socket],
-        [LD_W_ABS, 0, 0, DATA_ARG0],
-        [JEQ_K, 0, 1, AF_UNIX],
-        [RET_K, 0, 0, RET_ERRNO | EAFNOSUPPORT],
-        [RET_K, 0, 0, RET_ALLOW],
-    ];
-    const program = Buffer.alloc(ops.length * 8);
-    ops.forEach(([code, jt, jf, k], index) => {
-        program.writeUInt16LE(code, index * 8);
-        program.writeUInt8(jt, index * 8 + 2);
-        program.writeUInt8(jf, index * 8 + 3);
-        program.writeUInt32LE(k >>> 0, index * 8 + 4);
-    });
-    return program;
+    return assemble([
+        [LD_W_ABS, DATA_ARCH],
+        [JEQ_K, spec.audit, 'native', 'nosys'],
+        'native',
+        [LD_W_ABS, DATA_NR],
+        ...(spec.x32 ? [[JGE_K, X32_SYSCALL_BIT, 'nosys', 'checks']] : []),
+        'checks',
+        [JGE_K, IO_URING_FIRST, 'uring', 'calls'],
+        'uring',
+        [JGE_K, IO_URING_END, 'calls', 'nosys'],
+        'calls',
+        [JEQ_K, spec.socket, 'socket', 'notsocket'],
+        'notsocket',
+        [JEQ_K, spec.socketpair, 'socketpair', 'allow'],
+        'socket',
+        [LD_W_ABS, DATA_ARG0],
+        ...ALLOWED_FAMILIES.map((family, index) => [JEQ_K, family, 'allow', index === ALLOWED_FAMILIES.length - 1 ? 'nofamily' : `family${index + 1}`])
+            .flatMap((op, index) => (index === 0 ? [op] : [`family${index}`, op])),
+        'socketpair',
+        [LD_W_ABS, DATA_ARG1],
+        [AND_K, SOCK_TYPE_MASK],
+        [JEQ_K, SOCK_DGRAM, 'nofamily', 'allow'],
+        'nofamily',
+        [RET_K, RET_ERRNO | EAFNOSUPPORT],
+        'nosys',
+        [RET_K, RET_ERRNO | ENOSYS],
+        'allow',
+        [RET_K, RET_ALLOW],
+    ]);
 }
 
 /**
