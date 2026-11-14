@@ -103,7 +103,7 @@ describe('createBackend', () => {
 
 describe('managed backend (fake binary)', () => {
     it('starts, reports health, restarts after a crash and stops', { timeout: 20000 }, async () => {
-        const backend = createManagedBackend({ opencodePath: launcher('opencode-fake'), allowUnvalidated: true, logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-fake'), allowUnvalidated: true, sandbox: 'off', logger: silentLogger });
         try {
             await backend.start();
             assert.equal(backend.isReady(), true);
@@ -126,7 +126,7 @@ describe('managed backend (fake binary)', () => {
 
     it('keeps retrying when a restart fails before OpenCode even starts', { timeout: 30000 }, async () => {
         const binary = launcher('opencode-flaky');
-        const backend = createManagedBackend({ opencodePath: binary, allowUnvalidated: true, logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: binary, allowUnvalidated: true, sandbox: 'off', logger: silentLogger });
         try {
             await backend.start();
             const firstUrl = backend.getClient().baseUrl;
@@ -148,7 +148,7 @@ describe('managed backend (fake binary)', () => {
         const reported = probe.address().port;
         await new Promise((resolve) => probe.close(resolve));
         // The launcher's own --port comes first, so the fake binds it and ignores the gateway's --port 0.
-        const backend = createManagedBackend({ opencodePath: launcher('opencode-fixed-port', ['--port', String(reported)]), allowUnvalidated: true, logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-fixed-port', ['--port', String(reported)]), allowUnvalidated: true, sandbox: 'off', logger: silentLogger });
         try {
             await backend.start();
             assert.equal(backend.getClient().baseUrl, `http://127.0.0.1:${reported}`);
@@ -158,7 +158,7 @@ describe('managed backend (fake binary)', () => {
     });
 
     it('fails clearly when the binary exits during startup', { timeout: 20000 }, async () => {
-        const backend = createManagedBackend({ opencodePath: launcher('opencode-dies', ['--exit-immediately']), allowUnvalidated: true, logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-dies', ['--exit-immediately']), allowUnvalidated: true, sandbox: 'off', logger: silentLogger });
         await assert.rejects(backend.start(), /exited during startup/);
         await backend.stop();
     });
@@ -166,7 +166,7 @@ describe('managed backend (fake binary)', () => {
     it('refuses an OpenCode version it has not been validated against', { timeout: 20000 }, async () => {
         const lines = [];
         const logger = createLogger({ level: 'debug', sink: { out: (line) => lines.push(line), err: (line) => lines.push(line) } });
-        const backend = createManagedBackend({ opencodePath: launcher('opencode-unvalidated'), logger });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-unvalidated'), sandbox: 'off', logger });
         await assert.rejects(backend.start(), (error) => {
             assert.match(error.message, new RegExp(`OpenCode 7\\.7\\.7-fake speaking the v1 API is not the validated ${VALIDATED_OPENCODE_VERSION.replaceAll('.', '\\.')} runtime`));
             assert.match(error.message, /ALLOW_UNVALIDATED_BACKEND=true/);
@@ -175,7 +175,7 @@ describe('managed backend (fake binary)', () => {
         assert.equal(backend.isReady(), false);
         await backend.stop();
 
-        const allowed = createManagedBackend({ opencodePath: launcher('opencode-unvalidated'), allowUnvalidated: true, logger });
+        const allowed = createManagedBackend({ opencodePath: launcher('opencode-unvalidated'), allowUnvalidated: true, sandbox: 'off', logger });
         try {
             await allowed.start();
             assert.equal(allowed.isReady(), true);
@@ -194,7 +194,7 @@ describe('managed backend (fake binary)', () => {
     it('passes ALLOW_UNVALIDATED_BACKEND through to the managed backend', { timeout: 20000 }, async () => {
         const opencodePath = launcher('opencode-config-flag');
         for (const [flag, starts] of [['false', false], ['true', true]]) {
-            const backend = createBackend(loadConfig({}, { OPENCODE_PATH: opencodePath, ALLOW_UNVALIDATED_BACKEND: flag }), silentLogger);
+            const backend = createBackend(loadConfig({}, { OPENCODE_PATH: opencodePath, ALLOW_UNVALIDATED_BACKEND: flag, BACKEND_SANDBOX: 'off' }), silentLogger);
             try {
                 if (starts) await backend.start();
                 else await assert.rejects(backend.start(), /is not the validated/);
@@ -210,7 +210,7 @@ describe('managed backend (fake binary)', () => {
         fs.writeFileSync(versionFile, VALIDATED_OPENCODE_VERSION);
         const lines = [];
         const logger = createLogger({ level: 'debug', sink: { out: (line) => lines.push(line), err: (line) => lines.push(line) } });
-        const backend = createManagedBackend({ opencodePath: launcher('opencode-v2-upgraded', ['--api', 'v2', '--version-file', versionFile]), logger });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-v2-upgraded', ['--api', 'v2', '--version-file', versionFile]), sandbox: 'off', logger });
         try {
             await backend.start();
             assert.equal(backend.isReady(), true, 'the validated version on the OpenCode 2 API starts without the flag');
@@ -237,7 +237,7 @@ describe('managed backend (fake binary)', () => {
     });
 
     it('fails clearly when OPENCODE_PATH does not exist', async () => {
-        const backend = createManagedBackend({ opencodePath: path.join(tmp, 'missing', 'opencode'), allowUnvalidated: true, logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: path.join(tmp, 'missing', 'opencode'), allowUnvalidated: true, sandbox: 'off', logger: silentLogger });
         await assert.rejects(backend.start(), /does not point to a file/);
     });
 });

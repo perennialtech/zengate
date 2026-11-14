@@ -18,6 +18,7 @@ const SPEC = Object.freeze({
     ALLOW_INSECURE_BACKEND_HTTP: { type: 'bool', default: false },
     ALLOW_UNVALIDATED_BACKEND: { type: 'bool', default: false },
     ALLOW_ATTACHED_BACKEND: { type: 'bool', default: false },
+    BACKEND_SANDBOX: { type: 'enum', default: 'auto', values: ['auto', 'bwrap', 'off'] },
     OPENCODE_AGENT: { type: 'string', default: 'plan' },
     OPENCODE_PROFILE: { type: 'enum', default: 'compatible', values: ['compatible', 'chat'] },
     MAX_CONCURRENT: { type: 'int', default: 8, min: 1, max: 64 },
@@ -173,6 +174,9 @@ export function loadConfig(fileConfig = {}, env = process.env) {
     }
     if (!/^[\w.-]{1,64}$/.test(config.OPENCODE_AGENT || '')) {
         problems.push('OPENCODE_AGENT must be a simple agent name');
+    }
+    if (config.BACKEND_SANDBOX === 'bwrap' && config.OPENCODE_SERVER_URL) {
+        problems.push('BACKEND_SANDBOX=bwrap sandboxes the managed backend; it cannot apply to an attached OPENCODE_SERVER_URL');
     }
     if (config.OPENCODE_PROFILE === 'chat' && config.OPENCODE_SERVER_URL) {
         problems.push('OPENCODE_PROFILE=chat requires the managed backend; attached servers cannot establish this boundary');

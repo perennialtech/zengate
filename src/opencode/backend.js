@@ -1,9 +1,11 @@
 import { execFile, spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { backendOrigin, createOpencodeClient } from './client.js';
 import { probeBackend } from './detect.js';
 import { createOpencodeClientV2 } from './client-v2.js';
 import { CHAT_RUNTIME_VERSION, installChatProfile } from './chat-profile.js';
 import { VALIDATED_OPENCODE_VERSION } from './runtime.js';
+import { bwrapArgs, innerDirs, resolveSandbox } from './sandbox.js';
 import { resolveOpencodeBinary, spawnCommand } from './binary.js';
 import {
     backendEnv, createIsolatedRoot, HEARTBEAT_MS, randomPassword, recordBackendPid, removeIsolatedRoot, sweepStaleRoots, touchIsolatedRoot,
@@ -108,8 +110,9 @@ export function checkRuntimeVersion(version, { api = 'v2', allowUnvalidated }) {
  * Starts and supervises a private `opencode serve` bound to 127.0.0.1 on a
  * port it picks itself, with a random password. It restarts with backoff if it crashes.
  * Only the validated OpenCode release is accepted unless `allowUnvalidated` is set.
+ * `sandbox` is a BACKEND_SANDBOX mode (see sandbox.js).
  */
-export function createManagedBackend({ opencodePath, profile = 'compatible', allowUnvalidated = false, logger }) {
+export function createManagedBackend({ opencodePath, profile = 'compatible', allowUnvalidated = false, sandbox: sandboxMode = 'auto', logger }) {
     let client = null;
     let child = null;
     let dirs = null;
@@ -118,17 +121,29 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
     let restartDelay = 1000;
     let ready = false;
     let heartbeat = null;
+    /** undefined until decided on the first launch, then the sandbox to use or null. */
+    let sandbox;
 
     async function launch() {
         const binary = resolveOpencodeBinary(opencodePath);
+        // The sandbox mounts the binary's own directory, so follow symlinks to the real file.
+        const binaryPath = fs.realpathSync(binary.path);
         dirs = createIsolatedRoot();
         const { root } = dirs;
         const deadline = Date.now() + START_TIMEOUT_MS;
         const password = randomPassword();
-        const env = backendEnv(dirs, password);
-        if (profile === 'chat') env.OPENCODE_CONFIG_CONTENT = JSON.stringify(installChatProfile(dirs));
-        const { command, args, windowsVerbatimArguments } = spawnCommand(binary.path, ['serve', '--hostname', '127.0.0.1', '--port', '0']);
-        logger.debug('Starting OpenCode backend', { binary: binary.path, source: binary.source });
+        if (sandbox === undefined) {
+            sandbox = await resolveSandbox({ mode: sandboxMode, dirs, binary: binaryPath, env: backendEnv(innerDirs(dirs), password), logger });
+        }
+        // Inside the sandbox the scratch tree is always at the same path.
+        const seen = sandbox ? innerDirs(dirs) : dirs;
+        const env = backendEnv(seen, password);
+        if (profile === 'chat') env.OPENCODE_CONFIG_CONTENT = JSON.stringify(installChatProfile(dirs, seen));
+        const serveArgs = ['serve', '--hostname', '127.0.0.1', '--port', '0'];
+        const { command, args, windowsVerbatimArguments } = sandbox
+            ? { command: sandbox.bwrap, args: bwrapArgs({ dirs, binary: binaryPath, args: serveArgs, env }), windowsVerbatimArguments: false }
+            : spawnCommand(binary.path, serveArgs);
+        logger.debug('Starting OpenCode backend', { binary: binary.path, source: binary.source, sandbox: sandbox ? 'bwrap' : 'none' });
         const proc = spawn(command, args, {
             cwd: dirs.workspace,
             env,
@@ -168,7 +183,7 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
         ready = true;
         served = true;
         restartDelay = 1000;
-        logger.info(`OpenCode ${version || ''} backend ready (managed, isolated, tools disabled)`.replace('  ', ' '));
+        logger.info(`OpenCode ${version || ''} backend ready (managed, ${sandbox ? 'sandboxed' : 'isolated'}, tools disabled)`.replace('  ', ' '));
         logger.debug(`OpenCode speaks the ${client.api} API`);
     }
 
@@ -246,6 +261,8 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
         },
         isReady: () => ready,
         version: () => version,
+        /** 'bwrap' or 'none' once started. */
+        sandbox: () => (sandbox === undefined ? null : (sandbox ? 'bwrap' : 'none')),
         ownsAllSessions: true,
         async stop() {
             stopping = true;

@@ -105,6 +105,16 @@ describe('loadConfig', () => {
         assert.equal(loadConfig({}, { OPENCODE_SERVER_URL: 'http://127.0.0.1:4096', ALLOW_ATTACHED_BACKEND: 'yes' }).ALLOW_ATTACHED_BACKEND, true);
     });
 
+    it('parses BACKEND_SANDBOX and keeps it to the managed backend', () => {
+        assert.equal(loadConfig({}, {}).BACKEND_SANDBOX, 'auto');
+        assert.equal(loadConfig({}, { BACKEND_SANDBOX: 'BWRAP' }).BACKEND_SANDBOX, 'bwrap');
+        assert.equal(loadConfig({ BACKEND_SANDBOX: 'off' }, {}).BACKEND_SANDBOX, 'off');
+        assert.match(problemsOf(() => loadConfig({}, { BACKEND_SANDBOX: 'firejail' }))[0], /auto, bwrap, off/);
+        const attached = problemsOf(() => loadConfig({}, { BACKEND_SANDBOX: 'bwrap', OPENCODE_SERVER_URL: 'http://127.0.0.1:4096', ALLOW_ATTACHED_BACKEND: 'true' }));
+        assert.deepEqual(attached.length, 1);
+        assert.match(attached[0], /cannot apply to an attached OPENCODE_SERVER_URL/);
+    });
+
     it('rejects malformed and non-http backend URLs', () => {
         assert.match(problemsOf(() => loadConfig({ OPENCODE_SERVER_URL: 'not a url' }, {}))[0], /absolute http/);
         assert.match(problemsOf(() => loadConfig({ OPENCODE_SERVER_URL: 'ftp://127.0.0.1' }, {}))[0], /http or https/);

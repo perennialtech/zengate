@@ -31,6 +31,9 @@ StateDirectoryMode=0700
 Environment=CONFIG_FILE=/var/lib/zengate/config.json
 Environment=HOST=127.0.0.1
 Environment=PORT=8083
+# The hardening below already confines the OpenCode backend, and
+# RestrictNamespaces blocks the user namespaces bubblewrap would need.
+Environment=BACKEND_SANDBOX=off
 EnvironmentFile=-/etc/zengate.env
 
 # Hardening. The OpenCode backend only needs /tmp (private) and the network.
