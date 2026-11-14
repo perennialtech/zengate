@@ -35,7 +35,7 @@ flowchart LR
 OpenCode's free Zen models only work from inside OpenCode. So this gateway does not imitate OpenCode. It **runs the real OpenCode CLI** (`opencode serve`, installed automatically as an npm dependency) as a private backend and translates between the OpenAI API and OpenCode sessions:
 
 - Every API request becomes a short-lived OpenCode session, which is deleted afterwards.
-- The managed backend listens only on `127.0.0.1` with a random password, and its home and config directories are throwaway temp dirs, so your own OpenCode or Claude settings, agents and plugins are never loaded. On Linux with [bubblewrap](https://github.com/containers/bubblewrap) installed, the backend also runs in an operating-system sandbox that cannot see your home directory or other files (see [Backend sandbox](#backend-sandbox)).
+- The managed backend listens only on `127.0.0.1` with a random password, and its home and config directories are throwaway temp dirs, so your own OpenCode or Claude settings, agents and plugins are never loaded. On Linux with [bubblewrap](https://github.com/containers/bubblewrap) installed, the backend also runs in an operating-system sandbox that cannot see your home directory or other files; it still has network access (see [Backend sandbox](#backend-sandbox)).
 - **Managed OpenCode host tools are refused.** The default profile denies execute/browser access and asks then rejects other tool permissions; strict chat removes all host tools and denies every permission. Attached servers require their own equivalent controls (see [Attach mode](#attach-mode)). Attachment downloads requested by API clients are handled separately by the gateway.
 - Your API key protects *the gateway*. Nothing upstream needs a key.
 
@@ -299,13 +299,19 @@ The managed backend gets a clean environment. Only system basics and these host 
 
 Host tools are kept from running because the gateway rejects every permission request. That is a policy enforced by OpenCode, so on Linux the managed backend also runs under [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`, in the `bubblewrap` package of most distributions). Inside the sandbox OpenCode sees:
 
-- `/usr` and the other system library directories, read-only, plus the few `/etc` files needed for DNS, TLS certificates and the time zone, and any CA files named in `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` or `SSL_CERT_DIR`;
-- the OpenCode binary's own directory, read-only;
+- `/usr` and the other system library directories, read-only, plus the few `/etc` files needed for DNS, TLS certificates and the time zone, and any CA files named in `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` or `SSL_CERT_DIR`. When `/etc/resolv.conf` is a symlink into `/run` (systemd-resolved, NetworkManager, resolvconf), its target directory is mounted read-only so DNS changes show through;
+- the OpenCode binary itself, read-only (only the file, not the directory it is in);
 - its scratch tree, writable, always at `/zengate` (so prompts carry the same fixed paths instead of a random host directory), and a private `/tmp`.
 
-It does not see your home directory, `/root`, `/run` (SSH agent, Docker and other sockets), `/srv`, `/mnt`, the host `/tmp` or any other file. It runs in its own user, PID, IPC and UTS namespaces with the hostname `zengate`, and dies with the gateway. It keeps the network, because it has to reach Zen, so the sandbox limits what a runaway tool could read or change, not where it could connect.
+It does not see your home directory, `/root`, the rest of `/run` (SSH agent, Docker and other sockets on disk), `/srv`, `/mnt`, the host `/tmp` or any other file. It runs in its own user, PID, IPC and UTS namespaces with the hostname `zengate`, and dies with the gateway.
 
-At startup the gateway runs the backend's `--version` inside the sandbox to check that it works. Unprivileged user namespaces can be disabled, or blocked by AppArmor, Docker's seccomp profile or systemd's `RestrictNamespaces`; with `BACKEND_SANDBOX=auto` the gateway then starts without the sandbox and logs a warning that says why, and with `BACKEND_SANDBOX=bwrap` it refuses to start. The sandbox needs a native OpenCode binary: a launcher script that starts another runtime from elsewhere fails the check. There is no equivalent on macOS or Windows yet. The Docker image and the systemd unit set `BACKEND_SANDBOX=off`, because the container and the unit's own hardening (`ProtectHome`, `ProtectSystem=strict`, `PrivateTmp`) already confine the backend, and both block the namespaces bubblewrap needs.
+It keeps the host network, because it has to reach Zen. Sharing the network namespace also shares the host's abstract Unix sockets (X11 displays, some D-Bus session buses), so a seccomp filter refuses to create Unix-domain sockets inside the sandbox at all, and refuses system calls made through 32-bit or x32 entry points, which could get around it. Services listening on the host's loopback TCP ports (`127.0.0.1`) are still reachable, as is anything else on the network. So the sandbox stops a runaway tool from reading or changing your files and from talking to your desktop session, not from making network connections.
+
+If `/etc/resolv.conf` is a plain file, the sandbox gets a snapshot of it. The gateway polls the file every 5 seconds and restarts the backend when it changes, for example after you switch networks or connect a VPN. Requests in flight at that moment fail.
+
+At startup the gateway runs the backend's `--version` inside the sandbox to check that it works. Unprivileged user namespaces can be disabled, or blocked by AppArmor, Docker's seccomp profile or systemd's `RestrictNamespaces`; with `BACKEND_SANDBOX=auto` the gateway then starts without the sandbox and logs a warning that says why, and with `BACKEND_SANDBOX=bwrap` it refuses to start. The sandbox needs a native OpenCode binary: a launcher script that starts another runtime from elsewhere fails the check. If the check passes but serving still fails, the startup error says the backend runs under bubblewrap. There is no equivalent on macOS or Windows yet.
+
+The Docker image and the systemd unit set `BACKEND_SANDBOX=off`, because both block the namespaces bubblewrap needs. They confine the gateway and the backend together from the rest of the host, but not the backend from the gateway: there, the backend runs as the same user and could read the gateway's `config.json`, including its API key, if a tool ever got past the permission rejection.
 
 ### OpenCode versions
 

@@ -5,7 +5,7 @@ import { probeBackend } from './detect.js';
 import { createOpencodeClientV2 } from './client-v2.js';
 import { CHAT_RUNTIME_VERSION, installChatProfile } from './chat-profile.js';
 import { VALIDATED_OPENCODE_VERSION } from './runtime.js';
-import { bwrapArgs, innerDirs, resolveSandbox } from './sandbox.js';
+import { innerDirs, resolvConfPinned, resolveSandbox, spawnSandboxed } from './sandbox.js';
 import { resolveOpencodeBinary, spawnCommand } from './binary.js';
 import {
     backendEnv, createIsolatedRoot, HEARTBEAT_MS, randomPassword, recordBackendPid, removeIsolatedRoot, sweepStaleRoots, touchIsolatedRoot,
@@ -17,6 +17,7 @@ const START_TIMEOUT_MS = 60000;
 const SWEEP_EVERY_BEATS = 10;
 const MAX_RESTART_DELAY_MS = 30000;
 const ANSI = /\x1b\[[0-9;]*m/g;
+const RESOLV_WATCH = Object.freeze({ file: '/etc/resolv.conf', intervalMs: 5000 });
 
 const LISTENING = /listening on http:\/\/127\.0\.0\.1:(\d{1,5})\b/;
 
@@ -112,7 +113,7 @@ export function checkRuntimeVersion(version, { api = 'v2', allowUnvalidated }) {
  * Only the validated OpenCode release is accepted unless `allowUnvalidated` is set.
  * `sandbox` is a BACKEND_SANDBOX mode (see sandbox.js).
  */
-export function createManagedBackend({ opencodePath, profile = 'compatible', allowUnvalidated = false, sandbox: sandboxMode = 'auto', logger }) {
+export function createManagedBackend({ opencodePath, profile = 'compatible', allowUnvalidated = false, sandbox: sandboxMode = 'auto', resolvWatch = RESOLV_WATCH, logger }) {
     let client = null;
     let child = null;
     let dirs = null;
@@ -123,10 +124,34 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
     let heartbeat = null;
     /** undefined until decided on the first launch, then the sandbox to use or null. */
     let sandbox;
+    let watchingResolv = false;
+
+    /**
+     * A sandbox holding a plain-file resolv.conf keeps the copy it started
+     * with. When the host's changes (a new network or VPN), restart the
+     * backend so it resolves names with the new servers.
+     */
+    function onResolvChange(current, previous) {
+        if (stopping || !child || (current.ino === previous.ino && current.mtimeMs === previous.mtimeMs)) return;
+        logger.info(`${resolvWatch.file} changed; restarting the sandboxed OpenCode backend so it uses the new DNS settings`);
+        killTree(child);
+    }
+
+    function watchResolv() {
+        if (watchingResolv || !sandbox || !resolvConfPinned(resolvWatch.file)) return;
+        watchingResolv = true;
+        fs.watchFile(resolvWatch.file, { interval: resolvWatch.intervalMs, persistent: false }, onResolvChange);
+    }
+
+    function unwatchResolv() {
+        if (!watchingResolv) return;
+        fs.unwatchFile(resolvWatch.file, onResolvChange);
+        watchingResolv = false;
+    }
 
     async function launch() {
         const binary = resolveOpencodeBinary(opencodePath);
-        // The sandbox mounts the binary's own directory, so follow symlinks to the real file.
+        // The sandbox mounts the binary file itself, so follow symlinks to it.
         const binaryPath = fs.realpathSync(binary.path);
         dirs = createIsolatedRoot();
         const { root } = dirs;
@@ -140,18 +165,15 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
         const env = backendEnv(seen, password);
         if (profile === 'chat') env.OPENCODE_CONFIG_CONTENT = JSON.stringify(installChatProfile(dirs, seen));
         const serveArgs = ['serve', '--hostname', '127.0.0.1', '--port', '0'];
-        const { command, args, windowsVerbatimArguments } = sandbox
-            ? { command: sandbox.bwrap, args: bwrapArgs({ dirs, binary: binaryPath, args: serveArgs, env }), windowsVerbatimArguments: false }
-            : spawnCommand(binary.path, serveArgs);
         logger.debug('Starting OpenCode backend', { binary: binary.path, source: binary.source, sandbox: sandbox ? 'bwrap' : 'none' });
-        const proc = spawn(command, args, {
-            cwd: dirs.workspace,
-            env,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            detached: process.platform !== 'win32',
-            windowsHide: true,
-            windowsVerbatimArguments,
-        });
+        const options = { cwd: dirs.workspace, detached: process.platform !== 'win32', windowsHide: true };
+        let proc;
+        if (sandbox) {
+            proc = spawnSandboxed({ bwrap: sandbox.bwrap, dirs, binary: binaryPath, args: serveArgs, env, ...options });
+        } else {
+            const { command, args, windowsVerbatimArguments } = spawnCommand(binary.path, serveArgs);
+            proc = spawn(command, args, { ...options, env, stdio: ['ignore', 'pipe', 'pipe'], windowsVerbatimArguments });
+        }
         child = proc;
         if (proc.pid) recordBackendPid(root, proc.pid);
         pipeLogs(proc.stdout, logger);
@@ -166,8 +188,16 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
             // waiting for launch(); only a crash after it served is restarted here.
             if (!stopping && served) onCrash(signal || code, root);
         });
-        const port = await boundPort(proc, START_TIMEOUT_MS);
-        const found = await waitHealthy({ baseUrl: `http://127.0.0.1:${port}`, username: 'opencode', password }, deadline, () => dead);
+        let port;
+        let found;
+        try {
+            port = await boundPort(proc, START_TIMEOUT_MS);
+            found = await waitHealthy({ baseUrl: `http://127.0.0.1:${port}`, username: 'opencode', password }, deadline, () => dead);
+        } catch (error) {
+            // The --version probe passed, but serving can still fail inside the sandbox.
+            if (sandbox) error.message += ' (it runs under bubblewrap; LOG_LEVEL=debug shows its output, and BACKEND_SANDBOX=off rules the sandbox out)';
+            throw error;
+        }
         const reported = found.health.version || null;
         // Checked before the backend becomes current, so a refused restart leaves no trace in version() or getClient().
         if (!checkRuntimeVersion(reported, { api: found.client.api, allowUnvalidated })) {
@@ -183,6 +213,7 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
         ready = true;
         served = true;
         restartDelay = 1000;
+        watchResolv();
         logger.info(`OpenCode ${version || ''} backend ready (managed, ${sandbox ? 'sandboxed' : 'isolated'}, tools disabled)`.replace('  ', ' '));
         logger.debug(`OpenCode speaks the ${client.api} API`);
     }
@@ -250,6 +281,7 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
             } catch (error) {
                 stopping = true;
                 clearInterval(heartbeat);
+                unwatchResolv();
                 await terminate();
                 removeIsolatedRoot(dirs?.root);
                 throw error;
@@ -268,6 +300,7 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
             stopping = true;
             ready = false;
             clearInterval(heartbeat);
+            unwatchResolv();
             await terminate();
             removeIsolatedRoot(dirs?.root);
         },

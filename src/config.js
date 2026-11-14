@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { SANDBOX_MODES } from './opencode/sandbox.js';
 
 /**
  * Every setting can come from the environment or config.json (same key).
@@ -18,7 +19,7 @@ const SPEC = Object.freeze({
     ALLOW_INSECURE_BACKEND_HTTP: { type: 'bool', default: false },
     ALLOW_UNVALIDATED_BACKEND: { type: 'bool', default: false },
     ALLOW_ATTACHED_BACKEND: { type: 'bool', default: false },
-    BACKEND_SANDBOX: { type: 'enum', default: 'auto', values: ['auto', 'bwrap', 'off'] },
+    BACKEND_SANDBOX: { type: 'enum', default: 'auto', values: SANDBOX_MODES },
     OPENCODE_AGENT: { type: 'string', default: 'plan' },
     OPENCODE_PROFILE: { type: 'enum', default: 'compatible', values: ['compatible', 'chat'] },
     MAX_CONCURRENT: { type: 'int', default: 8, min: 1, max: 64 },

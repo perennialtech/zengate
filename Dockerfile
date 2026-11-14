@@ -34,8 +34,9 @@ COPY scripts/setup.mjs ./scripts/setup.mjs
 # keep it across restarts, or pass API_KEY as an environment variable instead.
 RUN mkdir -p /data && chown node:node /data
 VOLUME ["/data"]
-# The container already confines the OpenCode backend, and Docker's default
-# seccomp profile blocks the user namespaces bubblewrap would need.
+# Docker's default seccomp profile blocks the user namespaces bubblewrap
+# needs. The container confines the gateway and its OpenCode backend
+# together; the backend is not separated from the gateway's /data.
 ENV CONFIG_FILE=/data/config.json \
     HOST=0.0.0.0 \
     PORT=8083 \

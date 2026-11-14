@@ -1,13 +1,17 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createLogger } from '../src/logger.js';
+import { createLogger, silentLogger } from '../src/logger.js';
+import { createManagedBackend } from '../src/opencode/backend.js';
 import { resolveBundledOpencodeBinary } from '../src/opencode/binary.js';
 import { backendEnv, createIsolatedRoot, removeIsolatedRoot } from '../src/opencode/isolation.js';
-import { INNER_ROOT, bwrapArgs, findBwrap, innerBinary, innerDirs, probeSandbox, resolveSandbox } from '../src/opencode/sandbox.js';
+import {
+    INNER_ROOT, bwrapArgs, findBwrap, innerBinary, innerDirs, openSeccomp, probeSandbox, resolveSandbox, seccompProgram, spawnSandboxed,
+} from '../src/opencode/sandbox.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'zengate-sandbox-test-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -39,19 +43,65 @@ describe('sandbox arguments', () => {
 
     it('mounts only system directories, the binary and the scratch tree', () => {
         const dirs = fakeDirs();
-        const args = bwrapArgs({ dirs, binary: '/opt/oc/bin/opencode', args: ['serve', '--port', '0'], env: { SSL_CERT_FILE: '/srv/ca.pem', NODE_EXTRA_CA_CERTS: 'relative.pem' } });
+        const args = bwrapArgs({ dirs, binary: '/opt/oc/bin/opencode', args: ['serve', '--port', '0'], env: { SSL_CERT_FILE: '/srv/ca.pem', NODE_EXTRA_CA_CERTS: 'relative.pem' }, seccomp: true });
         const pairs = (flag) => args.flatMap((arg, index) => (arg === flag ? [[args[index + 1], args[index + 2]]] : []));
         assert.ok(args.includes('--unshare-all') && args.includes('--share-net') && args.includes('--die-with-parent') && args.includes('--new-session'));
-        assert.deepEqual(pairs('--bind'), [[dirs.root, INNER_ROOT]], 'the scratch tree is the only writable mount');
+        assert.equal(args[args.indexOf('--seccomp') + 1], '3');
+        const writable = ['--bind', '--bind-try', '--dev-bind', '--dev-bind-try'].flatMap(pairs);
+        assert.deepEqual(writable, [[dirs.root, INNER_ROOT]], 'the scratch tree is the only writable mount');
         const readOnly = [...pairs('--ro-bind'), ...pairs('--ro-bind-try')].map(([source]) => source);
-        assert.ok(readOnly.includes('/opt/oc/bin'));
+        assert.deepEqual(pairs('--ro-bind').find(([source]) => source.startsWith('/opt/')), ['/opt/oc/bin/opencode', '/zengate-bin/opencode'], 'only the binary file, not its directory');
         assert.ok(readOnly.includes('/srv/ca.pem'), 'CA files named in the environment are mounted');
         assert.ok(!readOnly.includes('relative.pem'));
         for (const source of readOnly) {
-            assert.ok(!source.startsWith('/home') && !source.startsWith('/run') && !source.startsWith('/root') && source !== '/' && source !== '/etc', source);
+            const resolverDir = /^\/run\/(systemd\/resolve|NetworkManager|resolvconf|connman)/.test(source);
+            assert.ok(!source.startsWith('/home') && (!source.startsWith('/run') || resolverDir) && !source.startsWith('/root') && source !== '/' && source !== '/etc', source);
+            assert.ok(!source.startsWith(os.homedir()), source);
         }
         assert.equal(args[args.indexOf('--chdir') + 1], `${INNER_ROOT}/workspace`);
         assert.deepEqual(args.slice(args.indexOf('--') + 1), ['/zengate-bin/opencode', 'serve', '--port', '0']);
+    });
+});
+
+/** A minimal classic-BPF interpreter for the instructions seccompProgram emits. */
+function runFilter(program, { nr, arch, arg0 = 0 }) {
+    const data = Buffer.alloc(64);
+    data.writeUInt32LE(nr >>> 0, 0);
+    data.writeUInt32LE(arch >>> 0, 4);
+    data.writeUInt32LE(arg0 >>> 0, 16);
+    let acc = 0;
+    for (let pc = 0; pc < program.length / 8;) {
+        const code = program.readUInt16LE(pc * 8);
+        const jt = program.readUInt8(pc * 8 + 2);
+        const jf = program.readUInt8(pc * 8 + 3);
+        const k = program.readUInt32LE(pc * 8 + 4);
+        pc += 1;
+        if (code === 0x20) acc = data.readUInt32LE(k);
+        else if (code === 0x15) pc += acc === k ? jt : jf;
+        else if (code === 0x35) pc += acc >= k ? jt : jf;
+        else if (code === 0x06) return k;
+        else throw new Error(`unexpected BPF code ${code}`);
+    }
+    throw new Error('fell off the end of the program');
+}
+
+describe('seccomp filter', () => {
+    const ALLOW = 0x7fff0000;
+    const errno = (value) => 0x00050000 | value;
+    for (const [arch, audit, socketNr, otherNr] of [['x64', 0xc000003e, 41, 42], ['arm64', 0xc00000b7, 198, 203]]) {
+        it(`refuses Unix sockets and foreign ABIs on ${arch}`, () => {
+            const program = seccompProgram(arch);
+            assert.equal(runFilter(program, { arch: audit, nr: socketNr, arg0: 1 }), errno(97), 'socket(AF_UNIX)');
+            assert.equal(runFilter(program, { arch: audit, nr: socketNr, arg0: 2 }), ALLOW, 'socket(AF_INET)');
+            assert.equal(runFilter(program, { arch: audit, nr: socketNr, arg0: 10 }), ALLOW, 'socket(AF_INET6)');
+            assert.equal(runFilter(program, { arch: audit, nr: otherNr, arg0: 1 }), ALLOW, 'other calls with a first argument of 1');
+            assert.equal(runFilter(program, { arch: 0x40000003, nr: 102, arg0: 1 }), errno(38), 'i386 entry point (socketcall)');
+        });
+    }
+    it('refuses the x32 ABI on x64 and has no program for other architectures', () => {
+        assert.equal(runFilter(seccompProgram('x64'), { arch: 0xc000003e, nr: 0x40000000 | 41, arg0: 1 }), errno(38));
+        assert.equal(seccompProgram('riscv64'), null);
+        assert.equal(openSeccomp({ root: tmp }, 'riscv64'), null);
     });
 });
 
@@ -109,6 +159,79 @@ describe('sandbox containment (real bubblewrap)', { skip: skipReal }, () => {
             assert.equal(fs.readFileSync(path.join(dirs.workspace, 'written.txt'), 'utf8'), 'inside\n');
         } finally {
             removeIsolatedRoot(dirs.root);
+        }
+    });
+
+    it('refuses Unix sockets inside, including the host abstract namespace it shares', { skip: process.arch in { x64: 1, arm64: 1 } ? false : 'no seccomp program for this architecture' }, async () => {
+        const name = `zengate-test-${process.pid}-${Date.now()}`;
+        const listener = net.createServer((socket) => { socket.on('error', () => {}); socket.destroy(); }).listen(`\0${name}`);
+        await new Promise((resolve) => listener.once('listening', resolve));
+        const dirs = createIsolatedRoot();
+        try {
+            const script = `const s = require('net').connect('\\0${name}'); s.on('connect', () => { console.log('CONNECTED'); process.exit(0); }); s.on('error', (e) => { console.log(e.code); process.exit(0); });`;
+            const run = (seccomp) => new Promise((resolve) => {
+                const options = { bwrap: findBwrap(), dirs, binary: fs.realpathSync(process.execPath), args: ['-e', script], env: { PATH: '/usr/bin:/bin' } };
+                const proc = seccomp ? spawnSandboxed(options) : spawnSync(options.bwrap, bwrapArgs(options), { encoding: 'utf8' });
+                if (!seccomp) return resolve(proc.stdout.trim());
+                let out = '';
+                proc.stdout.on('data', (chunk) => { out += chunk; });
+                proc.once('exit', () => resolve(out.trim()));
+                return undefined;
+            });
+            assert.equal(await run(false), 'CONNECTED', 'control: without the filter the shared abstract socket is reachable');
+            assert.equal(await run(true), 'EAFNOSUPPORT');
+        } finally {
+            listener.close();
+            removeIsolatedRoot(dirs.root);
+        }
+    });
+
+    it('serves, restarts after a crash and stops cleanly as the managed backend', { timeout: 120000 }, async () => {
+        for (const profile of ['compatible', 'chat']) {
+            const backend = createManagedBackend({ opencodePath: '', profile, sandbox: 'bwrap', logger: silentLogger });
+            let pids = [];
+            try {
+                await backend.start();
+                assert.equal(backend.sandbox(), 'bwrap', profile);
+                assert.equal((await backend.getClient().health()).healthy, true, profile);
+                const backendPid = () => fs.readdirSync(os.tmpdir())
+                    .filter((name) => name.startsWith('zengate-'))
+                    .map((name) => path.join(os.tmpdir(), name, 'backend.pid'))
+                    .filter((file) => fs.existsSync(file))
+                    .map((file) => Number(fs.readFileSync(file, 'utf8')))
+                    .filter((pid) => { try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('/zengate-bin/'); } catch { return false; } });
+                pids = backendPid();
+                assert.equal(pids.length >= 1, true, 'the sandboxed backend is running');
+                const first = backend.getClient().baseUrl;
+                for (const pid of pids) process.kill(pid, 'SIGKILL');
+                const deadline = Date.now() + 30000;
+                while (!(backend.isReady() && backend.getClient().baseUrl !== first) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+                assert.ok(backend.isReady(), `${profile}: restarted in the sandbox`);
+                pids = backendPid();
+            } finally {
+                await backend.stop();
+            }
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            for (const pid of pids) assert.throws(() => process.kill(pid, 0), /ESRCH/, `${profile}: pid ${pid} is gone after stop`);
+        }
+    });
+
+    it('restarts the backend when a pinned resolv.conf is replaced', { timeout: 60000 }, async () => {
+        const file = path.join(tmp, 'resolv.conf');
+        fs.writeFileSync(file, 'nameserver 192.0.2.1\n');
+        const { lines, logger } = captureLogger();
+        const backend = createManagedBackend({ opencodePath: '', sandbox: 'bwrap', resolvWatch: { file, intervalMs: 100 }, logger });
+        try {
+            await backend.start();
+            const first = backend.getClient().baseUrl;
+            fs.writeFileSync(`${file}.new`, 'nameserver 192.0.2.2\n');
+            fs.renameSync(`${file}.new`, file);
+            const deadline = Date.now() + 30000;
+            while (!(backend.isReady() && backend.getClient().baseUrl !== first) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+            assert.ok(lines.some((line) => /resolv\.conf changed; restarting the sandboxed OpenCode backend/.test(line)), lines.join('\n'));
+            assert.ok(backend.isReady() && backend.getClient().baseUrl !== first, 'a new backend serves');
+        } finally {
+            await backend.stop();
         }
     });
 
