@@ -27,13 +27,14 @@ describe('loadConfig', () => {
         assert.equal(loadConfig({}, { OPENCODE_PROFILE: 'chat' }).OPENCODE_PROFILE, 'chat');
         assert.throws(() => loadConfig({}, { OPENCODE_PROFILE: 'unknown' }), /compatible, chat/);
         assert.throws(() => loadConfig({}, { OPENCODE_PROFILE: 'chat', OPENCODE_SERVER_URL: 'http:\/\/127.0.0.1:4000' }), /requires the managed backend/);
-        assert.throws(() => loadConfig({}, { OPENCODE_PROFILE: 'chat', OPENCODE_AGENT: 'build' }), /dedicated zengate-chat/);
+        assert.throws(() => loadConfig({}, { OPENCODE_PROFILE: 'chat', OPENCODE_AGENT: 'general' }), /dedicated zengate-chat/);
+        for (const agent of ['build', 'plan', 'zengate-chat']) assert.equal(loadConfig({}, { OPENCODE_PROFILE: 'chat', OPENCODE_AGENT: agent }).OPENCODE_AGENT, agent);
     });
     it('applies defaults and freezes the result', () => {
         const config = loadConfig({}, {});
         assert.equal(config.PORT, 8083);
         assert.equal(config.HOST, '127.0.0.1');
-        assert.equal(config.OPENCODE_AGENT, 'plan');
+        assert.equal(config.OPENCODE_AGENT, 'build');
         assert.equal(config.MAX_CONCURRENT, 8);
         assert.equal(config.REQUEST_TIMEOUT_MS, 300000);
         assert.equal(config.LOG_LEVEL, 'info');
