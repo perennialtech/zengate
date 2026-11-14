@@ -60,6 +60,9 @@ export function securityWarnings(config) {
             ? `ALLOW_NO_AUTH is on and HOST=${config.HOST}: anyone who can reach this port can use the gateway.`
             : 'ALLOW_NO_AUTH is on: any local process or web page can use the gateway.');
     }
+    if (config.ALLOW_UNVALIDATED_BACKEND && !config.OPENCODE_SERVER_URL) {
+        warnings.push('ALLOW_UNVALIDATED_BACKEND is on: the managed backend starts even if it is not the validated OpenCode release (startup names the version it found).');
+    }
     if (exposed && !config.ALLOW_NO_AUTH) {
         warnings.push(`Listening on ${config.HOST}. Traffic is plain HTTP; put TLS (a reverse proxy) in front before exposing it beyond a trusted network.`);
     }
