@@ -85,15 +85,23 @@ describe('loadConfig', () => {
 
     it('requires https for a remote backend unless explicitly allowed', () => {
         assert.match(problemsOf(() => loadConfig({ OPENCODE_SERVER_URL: 'http://10.0.0.5:4096' }, {}))[0], /must use https/);
-        const allowed = loadConfig({ OPENCODE_SERVER_URL: 'http://10.0.0.5:4096/', ALLOW_INSECURE_BACKEND_HTTP: 'true' }, {});
+        const allowed = loadConfig({ OPENCODE_SERVER_URL: 'http://10.0.0.5:4096/', ALLOW_INSECURE_BACKEND_HTTP: 'true', ALLOW_UNVALIDATED_BACKEND: 'true' }, {});
         assert.equal(allowed.OPENCODE_SERVER_URL, 'http://10.0.0.5:4096');
-        assert.equal(loadConfig({ OPENCODE_SERVER_URL: 'https://remote.example//' }, {}).OPENCODE_SERVER_URL, 'https://remote.example');
+        assert.equal(loadConfig({ OPENCODE_SERVER_URL: 'https://remote.example//', ALLOW_UNVALIDATED_BACKEND: 'true' }, {}).OPENCODE_SERVER_URL, 'https://remote.example');
     });
 
     it('allows plain http for loopback backends', () => {
         for (const url of ['http://127.0.0.1:4096', 'http://localhost:4096', 'http://[::1]:4096']) {
-            assert.equal(loadConfig({ OPENCODE_SERVER_URL: url }, {}).OPENCODE_SERVER_URL, url);
+            assert.equal(loadConfig({ OPENCODE_SERVER_URL: url, ALLOW_UNVALIDATED_BACKEND: 'true' }, {}).OPENCODE_SERVER_URL, url);
         }
+    });
+
+    it('attaches to a server only with ALLOW_UNVALIDATED_BACKEND', () => {
+        const problems = problemsOf(() => loadConfig({ OPENCODE_SERVER_URL: 'http://127.0.0.1:4096' }, {}));
+        assert.equal(problems.length, 1);
+        assert.match(problems[0], /ALLOW_UNVALIDATED_BACKEND=true/);
+        assert.equal(loadConfig({}, {}).ALLOW_UNVALIDATED_BACKEND, false);
+        assert.equal(loadConfig({}, { OPENCODE_SERVER_URL: 'http://127.0.0.1:4096', ALLOW_UNVALIDATED_BACKEND: 'yes' }).ALLOW_UNVALIDATED_BACKEND, true);
     });
 
     it('rejects malformed and non-http backend URLs', () => {
@@ -103,13 +111,13 @@ describe('loadConfig', () => {
 
     it('rejects credentials in the backend URL and points to the dedicated settings', () => {
         for (const url of ['https://opencode:s3cret-pw@remote.example', 'http://user@127.0.0.1:4096', 'https://:s3cret-pw@remote.example']) {
-            const problems = problemsOf(() => loadConfig({ OPENCODE_SERVER_URL: url }, {}));
+            const problems = problemsOf(() => loadConfig({ OPENCODE_SERVER_URL: url, ALLOW_UNVALIDATED_BACKEND: 'true' }, {}));
             assert.equal(problems.length, 1, url);
             assert.match(problems[0], /must not contain a username or password/);
             assert.match(problems[0], /OPENCODE_SERVER_PASSWORD/);
             assert.doesNotMatch(problems[0], /s3cret-pw/);
         }
-        const separate = loadConfig({}, { OPENCODE_SERVER_URL: 'https://remote.example', OPENCODE_SERVER_USERNAME: 'me', OPENCODE_SERVER_PASSWORD: 's3cret-pw' });
+        const separate = loadConfig({}, { OPENCODE_SERVER_URL: 'https://remote.example', OPENCODE_SERVER_USERNAME: 'me', OPENCODE_SERVER_PASSWORD: 's3cret-pw', ALLOW_UNVALIDATED_BACKEND: 'true' });
         assert.equal(separate.OPENCODE_SERVER_PASSWORD, 's3cret-pw');
     });
 

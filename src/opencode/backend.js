@@ -3,6 +3,7 @@ import { backendOrigin, createOpencodeClient } from './client.js';
 import { probeBackend } from './detect.js';
 import { createOpencodeClientV2 } from './client-v2.js';
 import { CHAT_RUNTIME_VERSION, installChatProfile } from './chat-profile.js';
+import { VALIDATED_OPENCODE_VERSION } from './runtime.js';
 import { resolveOpencodeBinary, spawnCommand } from './binary.js';
 import {
     backendEnv, createIsolatedRoot, HEARTBEAT_MS, randomPassword, recordBackendPid, removeIsolatedRoot, sweepStaleRoots, touchIsolatedRoot,
@@ -89,10 +90,24 @@ function pipeLogs(stream, logger) {
 }
 
 /**
+ * Refuse a backend whose version differs from the one the gateway's tool
+ * rejection was validated against, unless the operator opted in.
+ * @returns {boolean} whether the version is the validated one
+ */
+export function checkRuntimeVersion(version, { allowUnvalidated }) {
+    if (version === VALIDATED_OPENCODE_VERSION) return true;
+    if (allowUnvalidated) return false;
+    throw new Error(`OpenCode ${version || '(unknown version)'} is not the validated ${VALIDATED_OPENCODE_VERSION} runtime. `
+        + 'Tool safety depends on how that exact release handles permissions. Use the bundled CLI (unset OPENCODE_PATH), '
+        + 'or set ALLOW_UNVALIDATED_BACKEND=true to accept an untested version.');
+}
+
+/**
  * Starts and supervises a private `opencode serve` bound to 127.0.0.1 on a
  * port it picks itself, with a random password. It restarts with backoff if it crashes.
+ * Only the validated OpenCode release is accepted unless `allowUnvalidated` is set.
  */
-export function createManagedBackend({ opencodePath, profile = 'compatible', logger }) {
+export function createManagedBackend({ opencodePath, profile = 'compatible', allowUnvalidated = false, logger }) {
     let client = null;
     let child = null;
     let dirs = null;
@@ -138,6 +153,9 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', log
         const found = await waitHealthy({ baseUrl: `http://127.0.0.1:${port}`, username: 'opencode', password }, deadline, () => dead);
         client = found.client;
         version = found.health.version || null;
+        if (!checkRuntimeVersion(version, { allowUnvalidated })) {
+            logger.warn(`OpenCode ${version || '(unknown version)'} is not the validated ${VALIDATED_OPENCODE_VERSION} runtime; running it because ALLOW_UNVALIDATED_BACKEND is on`);
+        }
         if (profile === 'chat') {
             if (client.api !== 'v2' || version !== CHAT_RUNTIME_VERSION) throw new Error(`OPENCODE_PROFILE=chat requires the validated OpenCode ${CHAT_RUNTIME_VERSION} runtime`);
             client = createOpencodeClientV2({ baseUrl: `http://127.0.0.1:${port}`, username: 'opencode', password, profile });

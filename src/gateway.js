@@ -20,7 +20,12 @@ export function createBackend(config, logger) {
             password: config.OPENCODE_SERVER_PASSWORD,
             logger,
         })
-        : createManagedBackend({ opencodePath: config.OPENCODE_PATH, profile: config.OPENCODE_PROFILE, logger });
+        : createManagedBackend({
+            opencodePath: config.OPENCODE_PATH,
+            profile: config.OPENCODE_PROFILE,
+            allowUnvalidated: config.ALLOW_UNVALIDATED_BACKEND,
+            logger,
+        });
 }
 
 export function listen(app, { PORT, HOST }) {

@@ -16,6 +16,7 @@ const SPEC = Object.freeze({
     OPENCODE_SERVER_USERNAME: { type: 'string', default: 'opencode' },
     OPENCODE_SERVER_PASSWORD: { type: 'string', default: '', secret: true },
     ALLOW_INSECURE_BACKEND_HTTP: { type: 'bool', default: false },
+    ALLOW_UNVALIDATED_BACKEND: { type: 'bool', default: false },
     OPENCODE_AGENT: { type: 'string', default: 'plan' },
     OPENCODE_PROFILE: { type: 'enum', default: 'compatible', values: ['compatible', 'chat'] },
     MAX_CONCURRENT: { type: 'int', default: 8, min: 1, max: 64 },
@@ -180,6 +181,10 @@ export function loadConfig(fileConfig = {}, env = process.env) {
     }
     validateKeys(config.API_KEYS, problems);
     validateServerUrl(config, problems);
+    if (config.OPENCODE_SERVER_URL && !config.ALLOW_UNVALIDATED_BACKEND) {
+        problems.push('OPENCODE_SERVER_URL attaches to a server whose permission config and OpenCode version the gateway cannot check; '
+            + 'set ALLOW_UNVALIDATED_BACKEND=true to accept that (see "Attach mode" in the README)');
+    }
     if (problems.length) throw new ConfigError(problems);
     return Object.freeze(config);
 }

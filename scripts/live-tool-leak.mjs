@@ -40,7 +40,8 @@ const PROMPT = [
 ].join(' ');
 
 const logger = createLogger({ level: 'error', sink: { out: (line) => process.stderr.write(`${line}\n`), err: (line) => process.stderr.write(`${line}\n`) } });
-const backend = createManagedBackend({ opencodePath: process.env.OPENCODE_PATH || '', logger });
+// This runner is how a new OpenCode release gets validated, so it accepts any version.
+const backend = createManagedBackend({ opencodePath: process.env.OPENCODE_PATH || '', allowUnvalidated: true, logger });
 const abort = new AbortController();
 const timer = setTimeout(() => abort.abort(new Error(`no result in ${TIMEOUT_MS / 1000}s`)), TIMEOUT_MS);
 

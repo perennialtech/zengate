@@ -120,6 +120,12 @@ describe('securityWarnings', () => {
         assert.deepEqual(securityWarnings(base), []);
     });
 
+    it('warns when an unvalidated backend is allowed', () => {
+        const warnings = securityWarnings({ ...base, ALLOW_UNVALIDATED_BACKEND: true });
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /ALLOW_UNVALIDATED_BACKEND is on/);
+    });
+
     it('warns about disabled auth, louder when exposed', () => {
         const local = securityWarnings({ ...base, ALLOW_NO_AUTH: true });
         assert.equal(local.length, 1);

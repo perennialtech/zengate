@@ -57,6 +57,9 @@
     "@opencode/cli": "2.2.6",
     "express": "^5.1.0"
   },
+  "allowScripts": {
+    "@opencode/cli@2.2.6": true
+  },
   "overrides": {
     "es-define-property": "npm:@socketregistry/es-define-property@^1",
     "safer-buffer": "npm:@socketregistry/safer-buffer@^1",

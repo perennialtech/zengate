@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/config.js';
 import { createBackend } from '../src/gateway.js';
 import { createLogger, silentLogger } from '../src/logger.js';
-import { createAttachedBackend, createManagedBackend } from '../src/opencode/backend.js';
+import { checkRuntimeVersion, createAttachedBackend, createManagedBackend } from '../src/opencode/backend.js';
+import { VALIDATED_OPENCODE_VERSION } from '../src/opencode/runtime.js';
 import { resolveBundledOpencodeBinary, resolveOpencodeBinary, spawnCommand } from '../src/opencode/binary.js';
 import {
     backendConfig, backendEnv, createIsolatedRoot, randomPassword, recordBackendPid, removeIsolatedRoot, sweepStaleRoots, touchIsolatedRoot,
@@ -91,7 +92,7 @@ describe('attached backend', () => {
 
 describe('createBackend', () => {
     it('picks attached mode when OPENCODE_SERVER_URL is set, managed otherwise', () => {
-        const attached = createBackend(loadConfig({}, { OPENCODE_SERVER_URL: 'http://127.0.0.1:4096' }), silentLogger);
+        const attached = createBackend(loadConfig({}, { OPENCODE_SERVER_URL: 'http://127.0.0.1:4096', ALLOW_UNVALIDATED_BACKEND: 'true' }), silentLogger);
         assert.equal(attached.mode, 'attached');
         const managed = createBackend(loadConfig({}, {}), silentLogger);
         assert.equal(managed.mode, 'managed');
@@ -102,7 +103,7 @@ describe('createBackend', () => {
 
 describe('managed backend (fake binary)', () => {
     it('starts, reports health, restarts after a crash and stops', { timeout: 20000 }, async () => {
-        const backend = createManagedBackend({ opencodePath: launcher('opencode-fake'), logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-fake'), allowUnvalidated: true, logger: silentLogger });
         try {
             await backend.start();
             assert.equal(backend.isReady(), true);
@@ -125,7 +126,7 @@ describe('managed backend (fake binary)', () => {
 
     it('keeps retrying when a restart fails before OpenCode even starts', { timeout: 30000 }, async () => {
         const binary = launcher('opencode-flaky');
-        const backend = createManagedBackend({ opencodePath: binary, logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: binary, allowUnvalidated: true, logger: silentLogger });
         try {
             await backend.start();
             const firstUrl = backend.getClient().baseUrl;
@@ -147,7 +148,7 @@ describe('managed backend (fake binary)', () => {
         const reported = probe.address().port;
         await new Promise((resolve) => probe.close(resolve));
         // The launcher's own --port comes first, so the fake binds it and ignores the gateway's --port 0.
-        const backend = createManagedBackend({ opencodePath: launcher('opencode-fixed-port', ['--port', String(reported)]), logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-fixed-port', ['--port', String(reported)]), allowUnvalidated: true, logger: silentLogger });
         try {
             await backend.start();
             assert.equal(backend.getClient().baseUrl, `http://127.0.0.1:${reported}`);
@@ -157,13 +158,49 @@ describe('managed backend (fake binary)', () => {
     });
 
     it('fails clearly when the binary exits during startup', { timeout: 20000 }, async () => {
-        const backend = createManagedBackend({ opencodePath: launcher('opencode-dies', ['--exit-immediately']), logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-dies', ['--exit-immediately']), allowUnvalidated: true, logger: silentLogger });
         await assert.rejects(backend.start(), /exited during startup/);
         await backend.stop();
     });
 
+    it('refuses an OpenCode version it has not been validated against', { timeout: 20000 }, async () => {
+        const lines = [];
+        const logger = createLogger({ level: 'debug', sink: { out: (line) => lines.push(line), err: (line) => lines.push(line) } });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-unvalidated'), logger });
+        await assert.rejects(backend.start(), (error) => {
+            assert.match(error.message, new RegExp(`OpenCode 7\\.7\\.7-fake is not the validated ${VALIDATED_OPENCODE_VERSION.replaceAll('.', '\\.')} runtime`));
+            assert.match(error.message, /ALLOW_UNVALIDATED_BACKEND=true/);
+            return true;
+        });
+        assert.equal(backend.isReady(), false);
+        await backend.stop();
+
+        const allowed = createManagedBackend({ opencodePath: launcher('opencode-unvalidated'), allowUnvalidated: true, logger });
+        try {
+            await allowed.start();
+            assert.equal(allowed.isReady(), true);
+            assert.ok(lines.some((line) => /not the validated .* ALLOW_UNVALIDATED_BACKEND is on/.test(line)), lines.join('\n'));
+        } finally {
+            await allowed.stop();
+        }
+    });
+
+    it('validates the exact OpenCode release the package depends on and allows to install', () => {
+        const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+        assert.equal(pkg.dependencies['@opencode/cli'], VALIDATED_OPENCODE_VERSION, 'bump VALIDATED_OPENCODE_VERSION only after rerunning test:leak and test:backend-contract');
+        assert.deepEqual(pkg.allowScripts, { [`@opencode/cli@${VALIDATED_OPENCODE_VERSION}`]: true });
+    });
+
+    it('accepts exactly the validated version', () => {
+        assert.equal(checkRuntimeVersion(VALIDATED_OPENCODE_VERSION, { allowUnvalidated: false }), true);
+        for (const version of [null, '', '2.2.7', `${VALIDATED_OPENCODE_VERSION}-beta`, `v${VALIDATED_OPENCODE_VERSION}`]) {
+            assert.throws(() => checkRuntimeVersion(version, { allowUnvalidated: false }), /is not the validated/, String(version));
+            assert.equal(checkRuntimeVersion(version, { allowUnvalidated: true }), false);
+        }
+    });
+
     it('fails clearly when OPENCODE_PATH does not exist', async () => {
-        const backend = createManagedBackend({ opencodePath: path.join(tmp, 'missing', 'opencode'), logger: silentLogger });
+        const backend = createManagedBackend({ opencodePath: path.join(tmp, 'missing', 'opencode'), allowUnvalidated: true, logger: silentLogger });
         await assert.rejects(backend.start(), /does not point to a file/);
     });
 });
@@ -181,7 +218,8 @@ describe('binary resolution', () => {
         });
         process.env.PATH = tmp;
         try {
-            assert.equal(resolveOpencodeBinary('').source, 'PATH', 'control: a replacement is available to the production resolver');
+            assert.equal(resolveOpencodeBinary('opencode').source, 'config', 'control: an explicit name still finds the replacement');
+            assert.throws(() => resolveOpencodeBinary(''), /bundled OpenCode CLI \(@opencode\/cli\) is not installed/);
             assert.throws(() => resolveBundledOpencodeBinary(), /Bundled OpenCode CLI not found/);
         } finally {
             mocked.mock.restore();
@@ -221,15 +259,31 @@ describe('binary resolution', () => {
         assert.ok(fs.statSync(found.path).isFile());
     });
 
-    it('falls back to the bundled package or PATH', () => {
-        let resolved;
+    it('uses the bundled package when OPENCODE_PATH is unset', () => {
+        const resolved = resolveOpencodeBinary('');
+        assert.equal(resolved.source, 'bundled');
+        assert.equal(resolved.path, resolveBundledOpencodeBinary().path);
+    });
+
+    it('explains a bundled stand-in left by blocked install scripts', () => {
+        const bundled = resolveBundledOpencodeBinary().path;
+        const stand = 'echo "Error: @opencode/cli\'s postinstall script was not run." >&2\nexit 1\n';
+        const { statSync, readFileSync } = fs;
+        const stat = mock.method(fs, 'statSync', (file, ...args) => (file === bundled ? { isFile: () => true, size: stand.length } : statSync(file, ...args)));
+        const read = mock.method(fs, 'readFileSync', (file, ...args) => (file === bundled ? stand : readFileSync(file, ...args)));
         try {
-            resolved = resolveOpencodeBinary('');
-        } catch (error) {
-            assert.match(error.message, /OpenCode CLI not found/);
-            return;
+            for (const resolve of [() => resolveOpencodeBinary(''), () => resolveBundledOpencodeBinary()]) {
+                assert.throws(resolve, (error) => {
+                    assert.match(error.message, /without running its postinstall script/);
+                    assert.match(error.message, /--allow-scripts=@opencode\/cli/);
+                    assert.ok(error.message.includes(path.join(path.dirname(path.dirname(bundled)), 'postinstall.mjs')));
+                    return true;
+                });
+            }
+        } finally {
+            stat.mock.restore();
+            read.mock.restore();
         }
-        assert.ok(['bundled', 'PATH'].includes(resolved.source));
     });
 
     it('builds spawn arguments, quoting .cmd shims on Windows', () => {

@@ -13,21 +13,51 @@ function isFile(file) {
     }
 }
 
+/**
+ * `@opencode/cli` ships a shell-script stand-in at bin/opencode.exe that its
+ * postinstall script replaces with the native executable. Package managers
+ * that block install scripts (npm 12 does by default) leave the stand-in,
+ * which only prints an error and exits.
+ */
+const PLACEHOLDER_MARKER = 'postinstall script was not run';
+const PLACEHOLDER_MAX_BYTES = 4096;
+
+function isPlaceholder(file) {
+    try {
+        if (fs.statSync(file).size > PLACEHOLDER_MAX_BYTES) return false;
+        return fs.readFileSync(file, 'utf8').includes(PLACEHOLDER_MARKER);
+    } catch {
+        return false;
+    }
+}
+
+function placeholderError(binary) {
+    const postinstall = path.join(path.dirname(path.dirname(binary)), 'postinstall.mjs');
+    return new Error([
+        'The bundled OpenCode CLI was installed without running its postinstall script, so only a stand-in is present.',
+        'npm 12 blocks dependency install scripts by default. Reinstall with `npm install -g --allow-scripts=@opencode/cli zengate`',
+        `(or \`npx --allow-scripts=@opencode/cli zengate\`), or run \`node "${postinstall}"\` once.`,
+    ].join(' '));
+}
+
 /** The binary shipped by the official `@opencode/cli` npm package (a dependency). */
 function bundledBinary() {
+    let binary;
     try {
-        const root = path.dirname(require.resolve('@opencode/cli/package.json'));
-        const binary = path.join(root, 'bin', 'opencode.exe');
-        return isFile(binary) ? binary : null;
+        binary = path.join(path.dirname(require.resolve('@opencode/cli/package.json')), 'bin', 'opencode.exe');
     } catch {
         return null;
     }
+    if (!isFile(binary)) return null;
+    if (isPlaceholder(binary)) throw placeholderError(binary);
+    return binary;
 }
 
 /** Contract tests must execute the installed dependency, with no environment/PATH fallback. */
 export function resolveBundledOpencodeBinary() {
     const binary = fileURLToPath(new URL('../../node_modules/@opencode/cli/bin/opencode.exe', import.meta.url));
     if (!isFile(binary)) throw new Error('Bundled OpenCode CLI not found. Run `npm ci`; contract tests do not use OPENCODE_PATH or PATH.');
+    if (isPlaceholder(binary)) throw placeholderError(binary);
     return { path: binary, source: 'bundled' };
 }
 
@@ -42,8 +72,9 @@ function searchPath(names) {
 }
 
 /**
- * Locate the OpenCode CLI: explicit OPENCODE_PATH, then the bundled
- * `@opencode/cli` package, then PATH. Never guesses other directories.
+ * Locate the OpenCode CLI: explicit OPENCODE_PATH, otherwise the bundled
+ * `@opencode/cli` package. An unrelated `opencode` on PATH is never picked up
+ * on its own: the gateway's tool safety depends on the exact release it runs.
  * @param {string} configured OPENCODE_PATH ('' for automatic)
  * @returns {{ path: string, source: 'config'|'bundled'|'PATH' }}
  */
@@ -63,9 +94,7 @@ export function resolveOpencodeBinary(configured) {
     }
     const bundled = bundledBinary();
     if (bundled) return { path: bundled, source: 'bundled' };
-    const found = searchPath(process.platform === 'win32' ? windowsNames : ['opencode']);
-    if (found) return { path: found, source: 'PATH' };
-    throw new Error('OpenCode CLI not found. Run `npm ci` (it installs the bundled @opencode/cli package) or set OPENCODE_PATH.');
+    throw new Error('The bundled OpenCode CLI (@opencode/cli) is not installed. Reinstall zengate, or run `npm ci` in a source checkout.');
 }
 
 /**
