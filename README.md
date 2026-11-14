@@ -221,6 +221,23 @@ curl http://127.0.0.1:8083/v1/chat/completions \
   -d '{"model":"big-pickle","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
+### From Claude Code or another MCP client
+
+`mcp.js` (`zengate-mcp` when installed from npm) is a stdio [Model Context Protocol](https://modelcontextprotocol.io) server. It lets an agent hand self-contained work to a free model in a context of its own, such as summarising large files, drafting or a second opinion, without that work filling the agent's own context.
+
+```bash
+claude mcp add --scope user zengate -- node /path/to/zengate/mcp.js
+```
+
+It has two tools:
+
+- `zen_ask` takes a `prompt`, plus optional `files` (absolute paths of text files, up to 256 KiB each and 1 MiB in all, read by the MCP server so their contents never pass through the agent), `system`, `model`, `max_output_tokens` and `context_id`. Each call without `context_id` starts a fresh conversation. The reply ends with a `context_id`; passing it back continues that conversation through the Responses API's `previous_response_id`. Contexts live in the gateway's memory and expire after an hour or on restart.
+- `zen_models` lists the models the gateway can run.
+
+The server finds the gateway and its key in the same `config.json` the gateway uses (`CONFIG_FILE` or the default location), and connects to its `HOST` and `PORT` (loopback when the gateway listens on all addresses). `ZENGATE_URL`, `ZENGATE_API_KEY` and `ZENGATE_MODEL` override the address, the key and the default model; without `ZENGATE_MODEL` it uses `big-pickle` when listed, or the first model. The gateway has to be running already.
+
+Everything sent through `zen_ask`, file contents included, goes to OpenCode Zen. The server's instructions tell the agent this and ask it never to send secrets, but nothing enforces it.
+
 ## API compatibility
 
 | Endpoint | Status |
