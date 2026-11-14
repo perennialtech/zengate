@@ -92,7 +92,7 @@ describe('attached backend', () => {
 
 describe('createBackend', () => {
     it('picks attached mode when OPENCODE_SERVER_URL is set, managed otherwise', () => {
-        const attached = createBackend(loadConfig({}, { OPENCODE_SERVER_URL: 'http://127.0.0.1:4096', ALLOW_UNVALIDATED_BACKEND: 'true' }), silentLogger);
+        const attached = createBackend(loadConfig({}, { OPENCODE_SERVER_URL: 'http://127.0.0.1:4096', ALLOW_ATTACHED_BACKEND: 'true' }), silentLogger);
         assert.equal(attached.mode, 'attached');
         const managed = createBackend(loadConfig({}, {}), silentLogger);
         assert.equal(managed.mode, 'managed');
@@ -168,7 +168,7 @@ describe('managed backend (fake binary)', () => {
         const logger = createLogger({ level: 'debug', sink: { out: (line) => lines.push(line), err: (line) => lines.push(line) } });
         const backend = createManagedBackend({ opencodePath: launcher('opencode-unvalidated'), logger });
         await assert.rejects(backend.start(), (error) => {
-            assert.match(error.message, new RegExp(`OpenCode 7\\.7\\.7-fake is not the validated ${VALIDATED_OPENCODE_VERSION.replaceAll('.', '\\.')} runtime`));
+            assert.match(error.message, new RegExp(`OpenCode 7\\.7\\.7-fake speaking the v1 API is not the validated ${VALIDATED_OPENCODE_VERSION.replaceAll('.', '\\.')} runtime`));
             assert.match(error.message, /ALLOW_UNVALIDATED_BACKEND=true/);
             return true;
         });
@@ -191,8 +191,45 @@ describe('managed backend (fake binary)', () => {
         assert.deepEqual(pkg.allowScripts, { [`@opencode/cli@${VALIDATED_OPENCODE_VERSION}`]: true });
     });
 
-    it('accepts exactly the validated version', () => {
+    it('passes ALLOW_UNVALIDATED_BACKEND through to the managed backend', { timeout: 20000 }, async () => {
+        const opencodePath = launcher('opencode-config-flag');
+        for (const [flag, starts] of [['false', false], ['true', true]]) {
+            const backend = createBackend(loadConfig({}, { OPENCODE_PATH: opencodePath, ALLOW_UNVALIDATED_BACKEND: flag }), silentLogger);
+            try {
+                if (starts) await backend.start();
+                else await assert.rejects(backend.start(), /is not the validated/);
+                assert.equal(backend.isReady(), starts);
+            } finally {
+                await backend.stop();
+            }
+        }
+    });
+
+    it('applies the version check when it restarts a crashed backend too', { timeout: 30000 }, async () => {
+        const versionFile = path.join(tmp, 'reported-version');
+        fs.writeFileSync(versionFile, VALIDATED_OPENCODE_VERSION);
+        const lines = [];
+        const logger = createLogger({ level: 'debug', sink: { out: (line) => lines.push(line), err: (line) => lines.push(line) } });
+        const backend = createManagedBackend({ opencodePath: launcher('opencode-v2-upgraded', ['--api', 'v2', '--version-file', versionFile]), logger });
+        try {
+            await backend.start();
+            assert.equal(backend.isReady(), true, 'the validated version on the OpenCode 2 API starts without the flag');
+            const first = backend.getClient();
+            fs.writeFileSync(versionFile, '9.9.9');
+            await fetch(`${first.baseUrl}/crash`).then((response) => response.text()).catch(() => {});
+            await waitFor(() => lines.some((line) => /restart failed.*OpenCode 9\.9\.9 is not the validated/.test(line)), { timeoutMs: 15000, intervalMs: 50 });
+            assert.equal(backend.isReady(), false);
+            assert.equal(backend.version(), VALIDATED_OPENCODE_VERSION, 'a refused restart does not replace the reported version');
+            assert.equal(backend.getClient(), first, 'nor the client');
+        } finally {
+            await backend.stop();
+        }
+    });
+
+    it('accepts exactly the validated version on the OpenCode 2 API', () => {
         assert.equal(checkRuntimeVersion(VALIDATED_OPENCODE_VERSION, { allowUnvalidated: false }), true);
+        assert.throws(() => checkRuntimeVersion(VALIDATED_OPENCODE_VERSION, { api: 'v1', allowUnvalidated: false }), /speaking the v1 API is not the validated/);
+        assert.equal(checkRuntimeVersion(VALIDATED_OPENCODE_VERSION, { api: 'v1', allowUnvalidated: true }), false);
         for (const version of [null, '', '2.2.7', `${VALIDATED_OPENCODE_VERSION}-beta`, `v${VALIDATED_OPENCODE_VERSION}`]) {
             assert.throws(() => checkRuntimeVersion(version, { allowUnvalidated: false }), /is not the validated/, String(version));
             assert.equal(checkRuntimeVersion(version, { allowUnvalidated: true }), false);
@@ -244,6 +281,13 @@ describe('binary resolution', () => {
             }
         }
     });
+    it('explains a stand-in named by OPENCODE_PATH', () => {
+        const stand = path.join(tmp, 'standin', 'bin', 'opencode.exe');
+        fs.mkdirSync(path.dirname(stand), { recursive: true });
+        fs.writeFileSync(stand, 'echo "Error: @opencode/cli\'s postinstall script was not run." >&2\nexit 1\n', { mode: 0o755 });
+        assert.throws(() => resolveOpencodeBinary(stand), /stand-in.*install script/);
+    });
+
     it('uses an explicit path when it is a file', () => {
         const file = path.join(tmp, 'opencode-bin');
         fs.writeFileSync(file, '');
@@ -274,7 +318,8 @@ describe('binary resolution', () => {
         try {
             for (const resolve of [() => resolveOpencodeBinary(''), () => resolveBundledOpencodeBinary()]) {
                 assert.throws(resolve, (error) => {
-                    assert.match(error.message, /without running its postinstall script/);
+                    assert.match(error.message, /stand-in: the package was installed without running its install script/);
+                    assert.match(error.message, /npm install-scripts approve @opencode\/cli/);
                     assert.match(error.message, /--allow-scripts=@opencode\/cli/);
                     assert.ok(error.message.includes(path.join(path.dirname(path.dirname(bundled)), 'postinstall.mjs')));
                     return true;

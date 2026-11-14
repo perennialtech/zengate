@@ -4,13 +4,18 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Breaking
+- A managed backend other than OpenCode 2.2.6 on the OpenCode 2 API no longer starts. OpenCode 1 users (`OPENCODE_PATH` pointing at an OpenCode 1 binary, as 2.0.0 suggested) and anyone testing another 2.x must set `ALLOW_UNVALIDATED_BACKEND=true`.
+- `OPENCODE_SERVER_URL` now requires `ALLOW_ATTACHED_BACKEND=true`.
+- An `opencode` on `PATH` is no longer used when the bundled CLI is missing.
+
 ### Security
-- The managed backend only runs the validated OpenCode release (2.2.6, the bundled `@opencode/cli`). Keeping host tools from running depends on how that exact release handles permissions, so any other version now stops startup with a message naming it. `ALLOW_UNVALIDATED_BACKEND=true` accepts another version and logs a warning.
-- An `opencode` on `PATH` is no longer used when the bundled CLI is missing. Set `OPENCODE_PATH` to run another binary.
-- Attaching to a server with `OPENCODE_SERVER_URL` now requires `ALLOW_UNVALIDATED_BACKEND=true`, since the gateway cannot check that server's version or permission config.
+- The managed backend only runs the validated OpenCode release (2.2.6 on the OpenCode 2 API, the bundled `@opencode/cli`), at startup and on every restart after a crash. Keeping host tools from running depends on how that exact release handles permissions, so anything else stops with a message naming what it found. `ALLOW_UNVALIDATED_BACKEND=true` accepts another version and logs a warning.
+- Without the bundled CLI the gateway no longer falls back to an `opencode` on `PATH`. Set `OPENCODE_PATH` to run another binary.
+- Attaching to a server with `OPENCODE_SERVER_URL` now requires `ALLOW_ATTACHED_BACKEND=true`, since the gateway cannot check that server's version or permission config.
 
 ### Fixed
-- When the bundled CLI was installed without its install script (npm 12 blocks dependency install scripts by default), startup failed with "OpenCode exited during startup". It now explains how to finish the install, and `package.json` allows the script for source checkouts.
+- When `@opencode/cli` was installed without its install script (npm 12 blocks dependency install scripts by default, and `ignore-scripts` does on any npm), startup failed with "OpenCode exited during startup". The gateway now recognises the package's stand-in binary, bundled or named by `OPENCODE_PATH`, and explains how to finish the install. `package.json` allows the script for source checkouts.
 
 ## [1.4.3] - 2026-11-13
 

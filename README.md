@@ -85,7 +85,7 @@ npm install -g zengate
 zengate
 ```
 
-npm 12 and later skip dependency install scripts unless you allow them, and the bundled OpenCode CLI needs its install script to fetch the native binary. With those versions, add `--allow-scripts=@opencode/cli`: `npx --allow-scripts=@opencode/cli zengate` or `npm install -g --allow-scripts=@opencode/cli zengate`. Without it, startup stops with an error that says how to finish the install.
+npm 12 and later skip dependency install scripts unless you allow them, and the bundled OpenCode CLI needs its install script to fetch the native binary. With those versions, add `--allow-scripts=@opencode/cli`: `npx --allow-scripts=@opencode/cli zengate` or `npm install -g --allow-scripts=@opencode/cli zengate`. In your own project, run `npm install-scripts approve @opencode/cli` (a source checkout of zengate already allows it in `package.json`). Without it, or with `ignore-scripts` set, startup stops with an error that says how to finish the install.
 
 **Docker**
 
@@ -282,7 +282,8 @@ Set values as environment variables or in the config file (same names; see [`con
 | `OPENCODE_SERVER_URL` | none | | Attach to an existing `opencode serve` instead of starting one (see [Attach mode](#attach-mode)). |
 | `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | `opencode` / none | | Basic auth for that server. Credentials inside `OPENCODE_SERVER_URL` are refused. |
 | `ALLOW_INSECURE_BACKEND_HTTP` | `false` | | Allow a non-loopback `http://` server URL. |
-| `ALLOW_UNVALIDATED_BACKEND` | `false` | | Accept a backend the gateway cannot vouch for: a managed OpenCode other than the validated 2.2.6 (OpenCode 1, or another 2.x), or any attached server. Startup logs a warning while it is on. See [OpenCode versions](#opencode-versions). |
+| `ALLOW_UNVALIDATED_BACKEND` | `false` | | Start the managed backend even when it is not the validated OpenCode 2.2.6 (OpenCode 1, or another 2.x). Startup logs a warning while it is on, naming the version found. See [OpenCode versions](#opencode-versions). |
+| `ALLOW_ATTACHED_BACKEND` | `false` | | Required to use `OPENCODE_SERVER_URL`, since the gateway cannot check that server's version or permission config. See [Attach mode](#attach-mode). |
 | `CONFIG_FILE` | see [First start](#first-start) | | Where the config file lives (environment variable only). |
 
 Value formats: booleans accept `1`/`0`, `true`/`false`, `yes`/`no` and `on`/`off`. Lists are comma-separated in the environment (`CORS_ORIGINS=https://a.example,https://b.example`) and JSON arrays in the config file.
@@ -291,11 +292,11 @@ The managed backend gets a clean environment. Only system basics and these host 
 
 ### Attach mode
 
-`OPENCODE_SERVER_URL` uses a server you run yourself, and needs `ALLOW_UNVALIDATED_BACKEND=true`, because the gateway cannot check that server's version or permission config. The gateway can only reject tool calls that server *asks* permission for; that happens in its own sessions and their subagents. It trusts the server's own permission config, plugins and MCP servers. If that config allows tools without asking, they will run. On OpenCode 2 this includes "always allow" rules saved for the server's project, which apply after the gateway's session rules and win over them; the `execute` tool and its `fetch` are reachable unless the server denies that action. Use it only with a server configured like the managed one: every permission set to `"ask"`, and `experimental.continue_loop_on_deny` set to `true` so a rejected tool does not end the turn with an empty reply. The managed default is safer. Remote servers must use `https://` unless you set `ALLOW_INSECURE_BACKEND_HTTP`.
+`OPENCODE_SERVER_URL` uses a server you run yourself, and needs `ALLOW_ATTACHED_BACKEND=true`, because the gateway cannot check that server's version or permission config. The gateway can only reject tool calls that server *asks* permission for; that happens in its own sessions and their subagents. It trusts the server's own permission config, plugins and MCP servers. If that config allows tools without asking, they will run. On OpenCode 2 this includes "always allow" rules saved for the server's project, which apply after the gateway's session rules and win over them; the `execute` tool and its `fetch` are reachable unless the server denies that action. Use it only with a server configured like the managed one: every permission set to `"ask"`, and `experimental.continue_loop_on_deny` set to `true` so a rejected tool does not end the turn with an empty reply. The managed default is safer. Remote servers must use `https://` unless you set `ALLOW_INSECURE_BACKEND_HTTP`.
 
 ### OpenCode versions
 
-The bundled backend is OpenCode 2.2.6 (the `@opencode/cli` package). Keeping host tools from running depends on how that release handles permissions, and only that release has been checked with `npm run test:backend-contract` and `npm run test:leak`. So the managed backend refuses to start with any other version, and says which one it found. `ALLOW_UNVALIDATED_BACKEND=true` lifts the check for testing another release; the gateway then logs a warning at startup. The validated version lives in `src/opencode/chat-plugin.js` and a unit test keeps it equal to the `@opencode/cli` dependency, so an upgrade fails the tests until someone reruns both checks and bumps it.
+The bundled backend is OpenCode 2.2.6 (the `@opencode/cli` package). Keeping host tools from running depends on how that release handles permissions, and only that release has been checked with `npm run test:backend-contract` and `npm run test:leak`. So the managed backend refuses to start (or restart after a crash) with any other version, or with a 2.2.6 that does not speak the OpenCode 2 API, and says what it found. `ALLOW_UNVALIDATED_BACKEND=true` lifts the check for testing another release; the gateway then logs a warning at startup. The validated version lives in `src/opencode/chat-plugin.js` and a unit test keeps it equal to the `@opencode/cli` dependency, so an upgrade fails the tests until someone reruns both checks and bumps it.
 
 With `ALLOW_UNVALIDATED_BACKEND`, the gateway also works with OpenCode 1 and tells the two apart by how the backend answers, whether it starts a binary (`OPENCODE_PATH`) or attaches to a server (`OPENCODE_SERVER_URL`). With OpenCode 2:
 

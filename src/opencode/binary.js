@@ -34,10 +34,18 @@ function isPlaceholder(file) {
 function placeholderError(binary) {
     const postinstall = path.join(path.dirname(path.dirname(binary)), 'postinstall.mjs');
     return new Error([
-        'The bundled OpenCode CLI was installed without running its postinstall script, so only a stand-in is present.',
-        'npm 12 blocks dependency install scripts by default. Reinstall with `npm install -g --allow-scripts=@opencode/cli zengate`',
-        `(or \`npx --allow-scripts=@opencode/cli zengate\`), or run \`node "${postinstall}"\` once.`,
+        `${binary} is @opencode/cli's stand-in: the package was installed without running its install script`,
+        '(npm 12 skips dependency install scripts unless allowed; `ignore-scripts` does the same on any npm).',
+        `Run \`node "${postinstall}"\` once, or reinstall with the script allowed:`,
+        '`npm install -g --allow-scripts=@opencode/cli zengate` or `npx --allow-scripts=@opencode/cli zengate`;',
+        'in a project or source checkout, `npm install-scripts approve @opencode/cli` and then `npm rebuild @opencode/cli`.',
     ].join(' '));
+}
+
+/** Throw the stand-in explanation when `file` is that stand-in. */
+function rejectPlaceholder(file) {
+    if (isPlaceholder(file)) throw placeholderError(file);
+    return file;
 }
 
 /** The binary shipped by the official `@opencode/cli` npm package (a dependency). */
@@ -48,17 +56,14 @@ function bundledBinary() {
     } catch {
         return null;
     }
-    if (!isFile(binary)) return null;
-    if (isPlaceholder(binary)) throw placeholderError(binary);
-    return binary;
+    return isFile(binary) ? rejectPlaceholder(binary) : null;
 }
 
 /** Contract tests must execute the installed dependency, with no environment/PATH fallback. */
 export function resolveBundledOpencodeBinary() {
     const binary = fileURLToPath(new URL('../../node_modules/@opencode/cli/bin/opencode.exe', import.meta.url));
     if (!isFile(binary)) throw new Error('Bundled OpenCode CLI not found. Run `npm ci`; contract tests do not use OPENCODE_PATH or PATH.');
-    if (isPlaceholder(binary)) throw placeholderError(binary);
-    return { path: binary, source: 'bundled' };
+    return { path: rejectPlaceholder(binary), source: 'bundled' };
 }
 
 function searchPath(names) {
@@ -84,12 +89,12 @@ export function resolveOpencodeBinary(configured) {
         const looksLikePath = configured.includes('/') || configured.includes('\\');
         if (looksLikePath) {
             const full = path.resolve(configured);
-            if (isFile(full)) return { path: full, source: 'config' };
+            if (isFile(full)) return { path: rejectPlaceholder(full), source: 'config' };
             throw new Error(`OPENCODE_PATH does not point to a file: ${full}`);
         }
         const names = process.platform === 'win32' ? windowsNames.map((n) => n.replace('opencode', configured)) : [configured];
         const found = searchPath(names);
-        if (found) return { path: found, source: 'config' };
+        if (found) return { path: rejectPlaceholder(found), source: 'config' };
         throw new Error(`OPENCODE_PATH '${configured}' was not found on PATH`);
     }
     const bundled = bundledBinary();

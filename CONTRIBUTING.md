@@ -61,7 +61,7 @@ zengate keeps its dependency list small on purpose: Express, and the official `@
 - Every `npm ci` in CI goes through [Socket Firewall](https://docs.socket.dev/docs/socket-firewall-free), which blocks known-malicious packages, and the `socket` workflow scans dependency changes in pull requests against the Socket security policy.
 - `package.json` `overrides` swap a few polyfills in Express's dependency tree for their maintained [`@socketregistry`](https://github.com/SocketDev/socket-registry) equivalents. Keep them when updating Express, and remove any that no longer match a package in the tree.
 - Dependabot opens weekly update pull requests for npm, GitHub Actions, the Docker base image and the hash-locked Python CI tooling (`.github/requirements/`). A new release is only proposed after it is a week old.
-- A `@opencode/cli` upgrade also needs `CHAT_RUNTIME_VERSION` in `src/opencode/chat-plugin.js` moved to the same version, or strict-chat tests fail. Run `npm run test:backend-contract` and `npm run test:leak` before raising it.
+- A `@opencode/cli` upgrade changes three things together: the dependency version, `CHAT_RUNTIME_VERSION` in `src/opencode/chat-plugin.js` (also the version the managed backend accepts, `VALIDATED_OPENCODE_VERSION`), and the `allowScripts` entry `@opencode/cli@<version>` in `package.json`. A unit test fails until all three match, and under npm 12 a stale `allowScripts` pin leaves the CLI uninstalled. Run `npm run test:backend-contract` and `npm run test:leak` before raising the version.
 
 ## Maintainers
 
