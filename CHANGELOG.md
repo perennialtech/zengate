@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- `mcp.js` (`zengate-mcp`), a stdio MCP server for Claude Code and other agents. Its `zen_ask` tool runs a prompt, with optional text files read on the server side, in a fresh context on a gateway model and returns a `context_id` that continues the conversation; `zen_models` lists the models. It reads the gateway's address and key from `config.json`.
+
 ### Breaking
 - A managed backend other than OpenCode 2.2.6 on the OpenCode 2 API no longer starts. OpenCode 1 users (`OPENCODE_PATH` pointing at an OpenCode 1 binary, as 2.0.0 suggested) and anyone testing another 2.x must set `ALLOW_UNVALIDATED_BACKEND=true`.
 - `OPENCODE_SERVER_URL` now requires `ALLOW_ATTACHED_BACKEND=true`.

@@ -17,10 +17,12 @@
   "main": "index.js",
   "type": "module",
   "bin": {
-    "zengate": "index.js"
+    "zengate": "index.js",
+    "zengate-mcp": "mcp.js"
   },
   "files": [
     "index.js",
+    "mcp.js",
     "src/",
     "scripts/setup.mjs",
     "config.json.example"
@@ -36,7 +38,8 @@
     "test:backend-contract": "node scripts/capture-context.mjs && node scripts/capture-context.mjs --strict && node scripts/capture-context.mjs --tool-attempt && node scripts/capture-context.mjs --strict --tool-attempt",
     "test:chat-live": "node scripts/live-chat-profile.mjs",
     "verify": "npm run lint && npm test",
-    "audit": "npm audit --omit=dev --audit-level=high"
+    "audit": "npm audit --omit=dev --audit-level=high",
+    "mcp": "node mcp.js"
   },
   "keywords": [
     "opencode",
