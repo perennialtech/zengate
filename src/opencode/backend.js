@@ -1,9 +1,11 @@
 import { execFile, spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { backendOrigin, createOpencodeClient } from './client.js';
 import { probeBackend } from './detect.js';
 import { createOpencodeClientV2 } from './client-v2.js';
 import { CHAT_RUNTIME_VERSION, installChatProfile } from './chat-profile.js';
 import { VALIDATED_OPENCODE_VERSION } from './runtime.js';
+import { innerDirs, resolvConfPinned, resolveSandbox, spawnSandboxed } from './sandbox.js';
 import { resolveOpencodeBinary, spawnCommand } from './binary.js';
 import {
     backendEnv, createIsolatedRoot, HEARTBEAT_MS, randomPassword, recordBackendPid, removeIsolatedRoot, sweepStaleRoots, touchIsolatedRoot,
@@ -15,6 +17,7 @@ const START_TIMEOUT_MS = 60000;
 const SWEEP_EVERY_BEATS = 10;
 const MAX_RESTART_DELAY_MS = 30000;
 const ANSI = /\x1b\[[0-9;]*m/g;
+const RESOLV_WATCH = Object.freeze({ file: '/etc/resolv.conf', intervalMs: 5000 });
 
 const LISTENING = /listening on http:\/\/127\.0\.0\.1:(\d{1,5})\b/;
 
@@ -108,8 +111,9 @@ export function checkRuntimeVersion(version, { api = 'v2', allowUnvalidated }) {
  * Starts and supervises a private `opencode serve` bound to 127.0.0.1 on a
  * port it picks itself, with a random password. It restarts with backoff if it crashes.
  * Only the validated OpenCode release is accepted unless `allowUnvalidated` is set.
+ * `sandbox` is a BACKEND_SANDBOX mode (see sandbox.js).
  */
-export function createManagedBackend({ opencodePath, profile = 'compatible', allowUnvalidated = false, logger }) {
+export function createManagedBackend({ opencodePath, profile = 'compatible', allowUnvalidated = false, sandbox: sandboxMode = 'auto', resolvWatch = RESOLV_WATCH, logger }) {
     let client = null;
     let child = null;
     let dirs = null;
@@ -118,25 +122,73 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
     let restartDelay = 1000;
     let ready = false;
     let heartbeat = null;
+    /** undefined until decided on the first launch, then the sandbox to use or null. */
+    let sandbox;
+    let watchingResolv = false;
+    /** The resolv.conf content the running backend started with. */
+    let resolvSeen = null;
+
+    const readResolv = () => {
+        try {
+            return fs.readFileSync(resolvWatch.file, 'utf8');
+        } catch {
+            return null;
+        }
+    };
+
+    /**
+     * A sandbox holding a pinned resolv.conf keeps the copy it started with.
+     * When the host's content changes (a new network or VPN), restart the
+     * backend so it resolves names with the new servers. Only a serving
+     * backend is restarted: one that is starting reads the file afresh.
+     */
+    function onResolvChange() {
+        if (stopping || !ready || !child) return;
+        const content = readResolv();
+        if (content === null || content === resolvSeen) return;
+        logger.info(`${resolvWatch.file} changed; restarting the sandboxed OpenCode backend so it uses the new DNS settings`);
+        killTree(child);
+    }
+
+    function watchResolv() {
+        if (!sandbox || !resolvConfPinned(resolvWatch.file)) return;
+        resolvSeen = readResolv();
+        if (watchingResolv) return;
+        watchingResolv = true;
+        fs.watchFile(resolvWatch.file, { interval: resolvWatch.intervalMs, persistent: false }, onResolvChange);
+    }
+
+    function unwatchResolv() {
+        if (!watchingResolv) return;
+        fs.unwatchFile(resolvWatch.file, onResolvChange);
+        watchingResolv = false;
+    }
 
     async function launch() {
         const binary = resolveOpencodeBinary(opencodePath);
+        // The sandbox mounts the binary file itself, so follow symlinks to it.
+        const binaryPath = fs.realpathSync(binary.path);
         dirs = createIsolatedRoot();
         const { root } = dirs;
         const deadline = Date.now() + START_TIMEOUT_MS;
         const password = randomPassword();
-        const env = backendEnv(dirs, password);
-        if (profile === 'chat') env.OPENCODE_CONFIG_CONTENT = JSON.stringify(installChatProfile(dirs));
-        const { command, args, windowsVerbatimArguments } = spawnCommand(binary.path, ['serve', '--hostname', '127.0.0.1', '--port', '0']);
-        logger.debug('Starting OpenCode backend', { binary: binary.path, source: binary.source });
-        const proc = spawn(command, args, {
-            cwd: dirs.workspace,
-            env,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            detached: process.platform !== 'win32',
-            windowsHide: true,
-            windowsVerbatimArguments,
-        });
+        if (sandbox === undefined) {
+            sandbox = await resolveSandbox({ mode: sandboxMode, dirs, binary: binaryPath, env: backendEnv(innerDirs(dirs), password), logger });
+        }
+        // Inside the sandbox the scratch tree is always at the same path.
+        const seen = sandbox ? innerDirs(dirs) : dirs;
+        const env = backendEnv(seen, password);
+        if (profile === 'chat') env.OPENCODE_CONFIG_CONTENT = JSON.stringify(installChatProfile(dirs, seen));
+        const serveArgs = ['serve', '--hostname', '127.0.0.1', '--port', '0'];
+        logger.debug('Starting OpenCode backend', { binary: binary.path, source: binary.source, sandbox: sandbox ? 'bwrap' : 'none' });
+        const options = { cwd: dirs.workspace, detached: process.platform !== 'win32', windowsHide: true };
+        let proc;
+        if (sandbox) {
+            proc = spawnSandboxed({ bwrap: sandbox.bwrap, dirs, binary: binaryPath, args: serveArgs, env, ...options });
+        } else {
+            const { command, args, windowsVerbatimArguments } = spawnCommand(binary.path, serveArgs);
+            proc = spawn(command, args, { ...options, env, stdio: ['ignore', 'pipe', 'pipe'], windowsVerbatimArguments });
+        }
         child = proc;
         if (proc.pid) recordBackendPid(root, proc.pid);
         pipeLogs(proc.stdout, logger);
@@ -151,8 +203,16 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
             // waiting for launch(); only a crash after it served is restarted here.
             if (!stopping && served) onCrash(signal || code, root);
         });
-        const port = await boundPort(proc, START_TIMEOUT_MS);
-        const found = await waitHealthy({ baseUrl: `http://127.0.0.1:${port}`, username: 'opencode', password }, deadline, () => dead);
+        let port;
+        let found;
+        try {
+            port = await boundPort(proc, START_TIMEOUT_MS);
+            found = await waitHealthy({ baseUrl: `http://127.0.0.1:${port}`, username: 'opencode', password }, deadline, () => dead);
+        } catch (error) {
+            // The --version probe passed, but serving can still fail inside the sandbox.
+            if (sandbox) error.message += ' (it runs under bubblewrap; LOG_LEVEL=debug shows its output, and BACKEND_SANDBOX=off rules the sandbox out)';
+            throw error;
+        }
         const reported = found.health.version || null;
         // Checked before the backend becomes current, so a refused restart leaves no trace in version() or getClient().
         if (!checkRuntimeVersion(reported, { api: found.client.api, allowUnvalidated })) {
@@ -168,7 +228,8 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
         ready = true;
         served = true;
         restartDelay = 1000;
-        logger.info(`OpenCode ${version || ''} backend ready (managed, isolated, tools disabled)`.replace('  ', ' '));
+        watchResolv();
+        logger.info(`OpenCode ${version || ''} backend ready (managed, ${sandbox ? 'sandboxed' : 'isolated'}, tools disabled)`.replace('  ', ' '));
         logger.debug(`OpenCode speaks the ${client.api} API`);
     }
 
@@ -235,6 +296,7 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
             } catch (error) {
                 stopping = true;
                 clearInterval(heartbeat);
+                unwatchResolv();
                 await terminate();
                 removeIsolatedRoot(dirs?.root);
                 throw error;
@@ -246,11 +308,14 @@ export function createManagedBackend({ opencodePath, profile = 'compatible', all
         },
         isReady: () => ready,
         version: () => version,
+        /** 'bwrap' or 'none' once started. */
+        sandbox: () => (sandbox === undefined ? null : (sandbox ? 'bwrap' : 'none')),
         ownsAllSessions: true,
         async stop() {
             stopping = true;
             ready = false;
             clearInterval(heartbeat);
+            unwatchResolv();
             await terminate();
             removeIsolatedRoot(dirs?.root);
         },

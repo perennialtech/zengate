@@ -35,7 +35,7 @@ flowchart LR
 OpenCode's free Zen models only work from inside OpenCode. So this gateway does not imitate OpenCode. It **runs the real OpenCode CLI** (`opencode serve`, installed automatically as an npm dependency) as a private backend and translates between the OpenAI API and OpenCode sessions:
 
 - Every API request becomes a short-lived OpenCode session, which is deleted afterwards.
-- The managed backend listens only on `127.0.0.1` with a random password, and its home and config directories are throwaway temp dirs, so your own OpenCode or Claude settings, agents and plugins are never loaded. This configuration isolation is not an operating-system sandbox.
+- The managed backend listens only on `127.0.0.1` with a random password, and its home and config directories are throwaway temp dirs, so your own OpenCode or Claude settings, agents and plugins are never loaded. On Linux with [bubblewrap](https://github.com/containers/bubblewrap) installed, the backend also runs in an operating-system sandbox that cannot see your home directory or other files; it still has network access (see [Backend sandbox](#backend-sandbox)).
 - **Managed OpenCode host tools are refused.** The default profile denies execute/browser access and asks then rejects other tool permissions; strict chat removes all host tools and denies every permission. Attached servers require their own equivalent controls (see [Attach mode](#attach-mode)). Attachment downloads requested by API clients are handled separately by the gateway.
 - Your API key protects *the gateway*. Nothing upstream needs a key.
 
@@ -282,6 +282,7 @@ Set values as environment variables or in the config file (same names; see [`con
 | `OPENCODE_SERVER_URL` | none | | Attach to an existing `opencode serve` instead of starting one (see [Attach mode](#attach-mode)). |
 | `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | `opencode` / none | | Basic auth for that server. Credentials inside `OPENCODE_SERVER_URL` are refused. |
 | `ALLOW_INSECURE_BACKEND_HTTP` | `false` | | Allow a non-loopback `http://` server URL. |
+| `BACKEND_SANDBOX` | `auto` | `auto`, `bwrap`, `off` | Run the managed backend in a bubblewrap sandbox (Linux). `auto` uses it when it works and warns otherwise, `bwrap` refuses to start without it, `off` skips it. See [Backend sandbox](#backend-sandbox). |
 | `ALLOW_UNVALIDATED_BACKEND` | `false` | | Start the managed backend even when it is not the validated OpenCode 2.2.6 (OpenCode 1, or another 2.x). Startup logs a warning while it is on, naming the version found. See [OpenCode versions](#opencode-versions). |
 | `ALLOW_ATTACHED_BACKEND` | `false` | | Required to use `OPENCODE_SERVER_URL`, since the gateway cannot check that server's version or permission config. See [Attach mode](#attach-mode). |
 | `CONFIG_FILE` | see [First start](#first-start) | | Where the config file lives (environment variable only). |
@@ -293,6 +294,24 @@ The managed backend gets a clean environment. Only system basics and these host 
 ### Attach mode
 
 `OPENCODE_SERVER_URL` uses a server you run yourself, and needs `ALLOW_ATTACHED_BACKEND=true`, because the gateway cannot check that server's version or permission config. The gateway can only reject tool calls that server *asks* permission for; that happens in its own sessions and their subagents. It trusts the server's own permission config, plugins and MCP servers. If that config allows tools without asking, they will run. On OpenCode 2 this includes "always allow" rules saved for the server's project, which apply after the gateway's session rules and win over them; the `execute` tool and its `fetch` are reachable unless the server denies that action. Use it only with a server configured like the managed one: every permission set to `"ask"`, and `experimental.continue_loop_on_deny` set to `true` so a rejected tool does not end the turn with an empty reply. The managed default is safer. Remote servers must use `https://` unless you set `ALLOW_INSECURE_BACKEND_HTTP`.
+
+### Backend sandbox
+
+Host tools are kept from running because the gateway rejects every permission request. That is a policy enforced by OpenCode, so on Linux the managed backend also runs under [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`, in the `bubblewrap` package of most distributions). Inside the sandbox OpenCode sees:
+
+- `/usr` and the other system library directories, read-only, plus the few `/etc` files needed for DNS, TLS certificates and the time zone, and any CA files named in `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` or `SSL_CERT_DIR`. When `/etc/resolv.conf` resolves to a file in `/run/systemd/resolve` or `/run/resolvconf`, that directory is mounted read-only so DNS changes show through;
+- the OpenCode binary itself, read-only (only the file, not the directory it is in);
+- its scratch tree, writable, always at `/zengate` (so prompts carry the same fixed paths instead of a random host directory), and a private `/tmp`.
+
+It does not see your home directory, `/root`, the rest of `/run` (SSH agent, Docker and other sockets on disk), `/srv`, `/mnt`, the host `/tmp` or any other file. It runs in its own user, PID, IPC and UTS namespaces with the hostname `zengate`, and dies with the gateway.
+
+It keeps the host network, because it has to reach Zen. Sharing the network namespace also shares the host's abstract Unix sockets (X11 displays, some D-Bus session buses), so a seccomp filter inside the sandbox allows `socket()` only for IPv4, IPv6 and netlink, refuses datagram `socketpair()` (which could send to an abstract address), and refuses io_uring (whose socket operation would get around the first check) and system calls made through 32-bit or x32 entry points (which use other numbers). Stream socket pairs, which a runtime uses for its own subprocesses, still work but cannot reach anything else. Services listening on the host's loopback TCP ports (`127.0.0.1`) are still reachable, as is anything else on the network. So the sandbox stops a runaway tool from reading or changing your files and from talking to your desktop session, not from making network connections.
+
+Otherwise (a plain file, or NetworkManager's `/run/NetworkManager/resolv.conf`, whose directory also holds device state and connection names), the sandbox gets a snapshot of it. The gateway polls the file every 5 seconds and restarts the backend when its content changes, for example after you switch networks or connect a VPN. Requests in flight at that moment fail.
+
+At startup the gateway runs the backend's `--version` inside the sandbox to check that it works. Unprivileged user namespaces can be disabled, or blocked by AppArmor, Docker's seccomp profile or systemd's `RestrictNamespaces`; with `BACKEND_SANDBOX=auto` the gateway then starts without the sandbox and logs a warning that says why, and with `BACKEND_SANDBOX=bwrap` it refuses to start. The sandbox needs a native OpenCode binary: a launcher script that starts another runtime from elsewhere fails the check. If the check passes but serving still fails, the startup error says the backend runs under bubblewrap. There is no equivalent on macOS or Windows yet.
+
+The Docker image and the systemd unit set `BACKEND_SANDBOX=off`, because both block the namespaces bubblewrap needs. They confine the gateway and the backend together from the rest of the host, but not the backend from the gateway: there, the backend runs as the same user and could read the gateway's `config.json`, including its API key, if a tool ever got past the permission rejection.
 
 ### OpenCode versions
 
@@ -356,7 +375,7 @@ sha256sum -c checksums.txt
 
 - The API key is required unless you set `ALLOW_NO_AUTH`. Keys are compared in constant time, the config file is written with mode `0600`, and keys are never logged: the first start reports where the generated key was saved, not the key.
 - The gateway binds to loopback by default and warns when it listens elsewhere, because traffic is plain HTTP, so put TLS in front.
-- The managed backend isolates OpenCode from your home directory and configuration and rejects host tools. Attached servers need equivalent operator-managed permissions; see [Attach mode](#attach-mode).
+- The managed backend isolates OpenCode from your home directory and configuration and rejects host tools. On Linux it also runs in a bubblewrap sandbox when one is available; see [Backend sandbox](#backend-sandbox). Attached servers need equivalent operator-managed permissions; see [Attach mode](#attach-mode).
 - Attachment URLs must be `https` and resolve to public addresses. Loopback, private, link-local and similar ranges (including IPv6 forms that embed them) are refused, which blocks SSRF into your network. The gateway fetches them itself and connects only to the address it checked, including on every redirect, so DNS rebinding cannot reach an internal host. OpenCode never sees the URL.
 - Conversation history is sent to the model as a tagged transcript. Message text, file names and tool names are escaped so they cannot fake another turn, a tool result or a function call.
 - Rate limiting, a bounded queue with a wait limit, body and attachment size limits, and per-request timeouts all apply. Requests that are uploading, queued or running are capped at `MAX_CONCURRENT + MAX_QUEUE`, which bounds the memory held by request bodies, and one client address may be uploading at most a quarter of that at once. Attachment hosts are resolved inside the request's slot and timeout, with at most two DNS lookups in flight across the gateway. Attachment URLs appear in errors and logs as their origin only, without path, query string or credentials. A request with `n` choices uses `n` concurrency slots, and slots are always released on disconnect or timeout.

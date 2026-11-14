@@ -24,6 +24,7 @@ export function createBackend(config, logger) {
             opencodePath: config.OPENCODE_PATH,
             profile: config.OPENCODE_PROFILE,
             allowUnvalidated: config.ALLOW_UNVALIDATED_BACKEND,
+            sandbox: config.BACKEND_SANDBOX,
             logger,
         });
 }

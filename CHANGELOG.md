@@ -14,6 +14,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - Without the bundled CLI the gateway no longer falls back to an `opencode` on `PATH`. Set `OPENCODE_PATH` to run another binary.
 - Attaching to a server with `OPENCODE_SERVER_URL` now requires `ALLOW_ATTACHED_BACKEND=true`, since the gateway cannot check that server's version or permission config.
 
+- On Linux, the managed backend runs in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox when `bwrap` is installed and works. OpenCode then sees only read-only system directories, its own binary, its scratch tree at the fixed path `/zengate` and a private `/tmp`: not your home directory, `/run` or other files. A seccomp filter allows only IPv4, IPv6 and netlink sockets and refuses datagram socket pairs, io_uring and non-native system call entry points, so the host's abstract Unix sockets (X11, some D-Bus buses) are out of reach even though the network is shared; loopback TCP services remain reachable. If a tool ever got past the permission rejection, it could not read or change your files. `BACKEND_SANDBOX` (`auto`, `bwrap` or `off`) controls it; `auto` warns when the sandbox is unavailable. The Docker image and the systemd unit set it to `off`, since they block the namespaces it needs.
+- A sandboxed backend follows DNS changes: a `/etc/resolv.conf` that resolves into `/run/systemd/resolve` or `/run/resolvconf` is mounted live, and any other is polled, with the backend restarted when its content changes.
+- Prompts in the default profile no longer carry a random temp directory or the machine's hostname when the backend is sandboxed: the paths are always `/zengate/...` and the hostname `zengate`.
+
 ### Fixed
 - When `@opencode/cli` was installed without its install script (npm 12 blocks dependency install scripts by default, and `ignore-scripts` does on any npm), startup failed with "OpenCode exited during startup". The gateway now recognises the package's stand-in binary, bundled or named by `OPENCODE_PATH`, and explains how to finish the install. `package.json` allows the script for source checkouts.
 

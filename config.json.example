@@ -26,6 +26,7 @@
     "ALLOW_INSECURE_BACKEND_HTTP": false,
     "ALLOW_UNVALIDATED_BACKEND": false,
     "ALLOW_ATTACHED_BACKEND": false,
+    "BACKEND_SANDBOX": "auto",
     "OPENCODE_AGENT": "plan",
     "OPENCODE_PROFILE": "compatible"
 }
