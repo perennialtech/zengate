@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { BackendError } from '../src/opencode/client.js';
 import { TOOL_REJECTION_MESSAGE, createEventHub } from '../src/opencode/events.js';
-import { createRunner } from '../src/opencode/runner.js';
+import { CHAT_REFUSAL_HINT, GATEWAY_NOTE, createRunner } from '../src/opencode/runner.js';
 import { ApiError } from '../src/server/errors.js';
 import { createLogger, silentLogger } from '../src/logger.js';
 import { waitFor } from './helpers/fake-opencode.mjs';
@@ -36,7 +36,7 @@ const assistant = (id, text, extra = {}) => ({
     parts: [{ type: 'reasoning', text: `think-${id}` }, { type: 'text', text }, { type: 'tool', tool: 'read' }],
 });
 
-function setup({ prompt, messages = async () => [], message, createSession, deleteSession, hubOptions, logger = silentLogger } = {}) {
+function setup({ prompt, messages = async () => [], message, createSession, deleteSession, hubOptions, logger = silentLogger, profile } = {}) {
     const hub = fakeHub(hubOptions);
     const log = { aborted: [], deleted: [], bodies: [] };
     const client = {
@@ -50,7 +50,7 @@ function setup({ prompt, messages = async () => [], message, createSession, dele
         abortSession: async (id) => { log.aborted.push(id); },
         deleteSession: deleteSession || (async (id) => { log.deleted.push(id); }),
     };
-    const runner = createRunner({ getClient: () => client, hub, logger, agent: 'plan' });
+    const runner = createRunner({ getClient: () => client, hub, logger, agent: 'plan', profile });
     return { runner, hub, log };
 }
 
@@ -88,7 +88,7 @@ describe('runner', () => {
         assert.equal(result.reasoning, 'think-m1');
         assert.deepEqual(result.usage, { input: 3, output: 2, reasoning: 1, cacheRead: 1 });
         assert.equal(result.finish, 'stop');
-        assert.deepEqual(log.bodies[0], { model: REQUEST.model, agent: 'plan', parts: REQUEST.parts, system: 'sys', variant: 'high', format: REQUEST.format });
+        assert.deepEqual(log.bodies[0], { model: REQUEST.model, agent: 'plan', parts: REQUEST.parts, system: `${GATEWAY_NOTE}\n\nsys`, variant: 'high', format: REQUEST.format });
         await tick();
         assert.deepEqual(log.deleted, ['ses_1']);
         assert.deepEqual(hub.released, ['ses_1']);
@@ -96,10 +96,31 @@ describe('runner', () => {
         assert.deepEqual(log.aborted, []);
     });
 
-    it('omits optional prompt fields', async () => {
+    it('omits optional prompt fields, keeping only the gateway note as system text', async () => {
         const { runner, log } = setup({ prompt: async () => assistant('m', 'x') });
         await runCollect(runner, { model: REQUEST.model, parts: REQUEST.parts });
-        assert.deepEqual(Object.keys(log.bodies[0]), ['model', 'agent', 'parts']);
+        assert.deepEqual(Object.keys(log.bodies[0]), ['model', 'agent', 'parts', 'system']);
+        assert.equal(log.bodies[0].system, GATEWAY_NOTE);
+    });
+
+    it('sends the caller system text unchanged in strict chat', async () => {
+        const { runner, log } = setup({ prompt: async () => assistant('m', 'x'), profile: 'chat' });
+        await runCollect(runner);
+        assert.equal(log.bodies[0].system, 'sys');
+        await runCollect(runner, { model: REQUEST.model, parts: REQUEST.parts });
+        assert.deepEqual(Object.keys(log.bodies[1]), ['model', 'agent', 'parts']);
+    });
+
+    it('explains the quota-shaped refusal in strict chat only', async () => {
+        const quota = () => assistant('m', '', { error: { name: 'APIError', data: { statusCode: 429, responseBody: JSON.stringify({ error: { code: 'insufficient_quota' } }) } } });
+        for (const [profile, hinted] of [['chat', true], ['compatible', false]]) {
+            const { runner } = setup({ prompt: async () => quota(), profile });
+            await assert.rejects(runCollect(runner), (error) => {
+                assert.equal(error.code, 'upstream_quota_exhausted', JSON.stringify(error));
+                assert.equal(error.message.includes(CHAT_REFUSAL_HINT), hinted, profile);
+                return true;
+            });
+        }
     });
 
     it('re-reads the earlier assistant messages one by one when the turn spans several', async () => {

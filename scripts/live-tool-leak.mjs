@@ -94,7 +94,10 @@ async function main() {
 
     const { id: sessionId } = await client.createSession({ signal: abort.signal });
     const watcher = watch(client, sessionId, abort.signal).catch(() => {});
-    const reply = await client.prompt(sessionId, { model, parts: [{ type: 'text', text: PROMPT }] }, { signal: abort.signal });
+    // The gateway's default agent; AGENT=plan (or another) checks a different one.
+    const agent = process.env.AGENT || 'build';
+    out(`agent ${agent}`);
+    const reply = await client.prompt(sessionId, { model, agent, parts: [{ type: 'text', text: PROMPT }] }, { signal: abort.signal });
     if (reply.info.error) out(`  the model answered with an error: ${reply.info.error.data?.message || reply.info.error.name}`);
     await client.deleteSession(sessionId).catch(() => {});
     abort.abort();

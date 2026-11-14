@@ -1,6 +1,7 @@
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { TOOL_REJECTION_MESSAGE } from '../src/opencode/events.js';
+import { GATEWAY_NOTE } from '../src/opencode/runner.js';
 import { FAKE_VERSION, promptText, streamTurn, waitFor } from './helpers/fake-opencode.mjs';
 import { KEY, OTHER_KEY, readSse, startStack } from './helpers/gateway.mjs';
 
@@ -117,8 +118,8 @@ describe('gateway over HTTP (fake OpenCode backend)', () => {
             });
             const sent = stack.fake.state.prompts[before].body;
             assert.deepEqual(sent.model, { providerID: 'opencode', modelID: 'big-pickle' });
-            assert.equal(sent.agent, 'plan');
-            assert.equal(sent.system, 'Be nice');
+            assert.equal(sent.agent, 'build');
+            assert.equal(sent.system, `${GATEWAY_NOTE}\n\nBe nice`);
             assert.equal(sent.variant, 'high');
             assert.deepEqual(sent.parts, [{ type: 'text', text: 'hello' }]);
         });
@@ -334,7 +335,7 @@ describe('gateway over HTTP (fake OpenCode backend)', () => {
             assert.equal(first.body.output[0].type, 'message');
             assert.equal(first.body.output[0].content[0].text, 'Echo: remember 7');
             assert.equal(first.body.usage.input_tokens, 12);
-            assert.equal(stack.fake.state.prompts.at(-1).body.system, 'Be brief');
+            assert.equal(stack.fake.state.prompts.at(-1).body.system, `${GATEWAY_NOTE}\n\nBe brief`);
 
             const fetched = await stack.json(`/v1/responses/${first.body.id}`);
             assert.deepEqual(fetched.body, first.body);

@@ -2,6 +2,7 @@ import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { promptText, streamTurn, waitFor } from './helpers/fake-opencode.mjs';
 import { readSse, startStack } from './helpers/gateway.mjs';
+import { GATEWAY_NOTE } from '../src/opencode/runner.js';
 
 const MODEL = 'big-pickle';
 
@@ -21,7 +22,7 @@ describe('legacy completions and max_tokens (fake OpenCode backend)', () => {
         assert.deepEqual(body.choices, [{ text: 'Once upon aEcho: Once upon a', index: 0, logprobs: null, finish_reason: 'stop' }]);
         assert.equal(body.usage.total_tokens, 17);
         const sent = stack.fake.state.prompts.at(-1).body;
-        assert.match(sent.system, /^Continue the text/);
+        assert.ok(sent.system.startsWith(`${GATEWAY_NOTE}\n\nContinue the text`), sent.system);
         assert.equal(promptText(sent), 'Once upon a');
     });
 
